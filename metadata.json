@@ -1,0 +1,7 @@
+{
+  "name": "MAHAGURU CENTER AUDIO CONSOLE",
+  "description": "Advanced AI-powered audio transcription and analysis console for Sinhala and English speech.",
+  "requestFramePermissions": [
+    "microphone"
+  ]
+}
