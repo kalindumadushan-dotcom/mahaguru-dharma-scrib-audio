@@ -6,20 +6,25 @@
   --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, monospace;
   --font-display: "Cormorant Garamond", serif;
 
+  /* Dark mode defaults */
   --color-spiritual-bg: #0f373b;
-  /* Dark Teal */
   --color-spiritual-border: #13555c;
-  /* Medium Teal */
   --color-spiritual-accent: #facc15;
-  /* Yellow */
   --color-spiritual-secondary: #eab308;
-  /* Darker Yellow */
   --color-spiritual-glow: rgba(250, 204, 21, 0.15);
+}
+
+/* Light mode overrides applied via data-theme="light" on root div */
+[data-theme="light"] {
+  --color-spiritual-bg: #edf8f8;
+  --color-spiritual-border: #99d6d8;
+  --color-spiritual-glow: rgba(250, 204, 21, 0.25);
+  color-scheme: light;
 }
 
 @layer base {
   body {
-    @apply bg-spiritual-bg text-teal-100/80 selection:bg-spiritual-accent selection:text-black;
+    @apply bg-spiritual-bg selection:bg-spiritual-accent selection:text-black;
     background-image:
       radial-gradient(circle at 50% 0%, rgba(250, 204, 21, 0.05) 0%, transparent 70%),
       url('https://www.transparenttextures.com/patterns/paper-fibers.png');
@@ -31,17 +36,35 @@
     @apply bg-teal-900 border border-spiritual-border rounded-2xl overflow-hidden shadow-2xl;
   }
 
-  .spiritual-glow {
-    box-shadow: 0 0 30px var(--color-spiritual-glow);
+  /* Light mode: retheme card and teal utility classes */
+  [data-theme="light"] .spiritual-card {
+    background-color: #d9eef0;
+    border-color: #99d6d8;
+    color: #0c3336;
+    box-shadow: 0 4px 24px rgba(15,55,59,0.10);
   }
+  [data-theme="light"] .bg-teal-900 { background-color: #d9eef0 !important; color: #0c3336; }
+  [data-theme="light"] .bg-teal-800 { background-color: #c8e8ea !important; color: #0c3336; }
+  [data-theme="light"] .bg-teal-700 { background-color: #b0dde0 !important; color: #0c3336; }
+  [data-theme="light"] [class*="bg-teal-800/"] { background-color: rgba(200,232,234,0.6) !important; }
+  [data-theme="light"] [class*="bg-teal-800"]:not([class*="hover"]) { background-color: #c8e8ea !important; color: #0c3336; }
+  [data-theme="light"] .border-spiritual-border { border-color: #99d6d8 !important; }
+  [data-theme="light"] [class*="border-teal"] { border-color: rgba(15,61,62,0.20) !important; }
+  [data-theme="light"] .text-teal-100,
+  [data-theme="light"] [class*="text-teal-1"] { color: #0c3336 !important; }
+  [data-theme="light"] .opacity-80 { color: rgba(12,51,54,0.85); }
+  [data-theme="light"] input,
+  [data-theme="light"] textarea {
+    background-color: #d9eef0 !important;
+    color: #0c3336 !important;
+    border-color: #99d6d8 !important;
+  }
+  [data-theme="light"] input::placeholder,
+  [data-theme="light"] textarea::placeholder { color: rgba(12,51,54,0.4) !important; }
 
-  .spiritual-text-glow {
-    text-shadow: 0 0 15px var(--color-spiritual-glow);
-  }
-
-  .zen-pulse {
-    animation: zen-pulse 4s ease-in-out infinite;
-  }
+  .spiritual-glow { box-shadow: 0 0 30px var(--color-spiritual-glow); }
+  .spiritual-text-glow { text-shadow: 0 0 15px var(--color-spiritual-glow); }
+  .zen-pulse { animation: zen-pulse 4s ease-in-out infinite; }
 }
 
 @keyframes zen-pulse {

@@ -89,8 +89,12 @@ export default function App() {
   const savedRateKey = 'dharma_scribe_transcribe_rate';
   const getSavedRate = () => parseFloat(localStorage.getItem(savedRateKey) || '0') || null;
   const [userApiKey, setUserApiKey] = useState<string>(() => localStorage.getItem('dharma_user_api_key') || '');
-  const [apiKeyInput, setApiKeyInput] = useState('');
-  const [showApiKeyInput, setShowApiKeyInput] = useState(false);
+  const [userGoogleApiKey, setUserGoogleApiKey] = useState<string>(() => localStorage.getItem('dharma_google_api_key') || '');
+  const [userClientId, setUserClientId] = useState<string>(() => localStorage.getItem('dharma_google_client_id') || '');
+  const [userClientSecret, setUserClientSecret] = useState<string>(() => localStorage.getItem('dharma_google_client_secret') || '');
+  const [showSettingsPanel, setShowSettingsPanel] = useState(false);
+  // Temp inputs for the settings panel
+  const [keyInputs, setKeyInputs] = useState({ gemini: '', googleApi: '', clientId: '', clientSecret: '' });
   const [isFetchingDrive, setIsFetchingDrive] = useState(false);
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const editorRef = useRef<HTMLDivElement | null>(null);
@@ -370,28 +374,36 @@ export default function App() {
   };
 
   const getApiKey = () => {
-    // User-supplied key takes priority over environment variable
-    if (userApiKey && userApiKey !== 'undefined' && userApiKey !== 'null') return userApiKey;
+    if (userApiKey && userApiKey !== 'undefined') return userApiKey;
     const key = process.env.GEMINI_API_KEY || (process.env as any).API_KEY;
     if (!key || key === 'undefined' || key === 'null') return '';
     return key;
   };
 
-  const handleSaveUserApiKey = () => {
-    const trimmed = apiKeyInput.trim();
-    if (trimmed) {
-      localStorage.setItem('dharma_user_api_key', trimmed);
-      setUserApiKey(trimmed);
-      setApiKeyInput('');
-      setShowApiKeyInput(false);
-    }
+  const saveKey = (storageKey: string, value: string, setter: (v: string) => void) => {
+    const trimmed = value.trim();
+    localStorage.setItem(storageKey, trimmed);
+    setter(trimmed);
   };
 
-  const handleClearUserApiKey = () => {
-    localStorage.removeItem('dharma_user_api_key');
-    setUserApiKey('');
-    setApiKeyInput('');
+  const clearKey = (storageKey: string, setter: (v: string) => void) => {
+    localStorage.removeItem(storageKey);
+    setter('');
   };
+
+  const handleSaveAllKeys = () => {
+    if (keyInputs.gemini) saveKey('dharma_user_api_key', keyInputs.gemini, setUserApiKey);
+    if (keyInputs.googleApi) saveKey('dharma_google_api_key', keyInputs.googleApi, setUserGoogleApiKey);
+    if (keyInputs.clientId) saveKey('dharma_google_client_id', keyInputs.clientId, setUserClientId);
+    if (keyInputs.clientSecret) saveKey('dharma_google_client_secret', keyInputs.clientSecret, setUserClientSecret);
+    setKeyInputs({ gemini: '', googleApi: '', clientId: '', clientSecret: '' });
+    setShowSettingsPanel(false);
+  };
+
+  // Helper: get effective Google API key (user override > env)
+  const getGoogleApiKey = () => userGoogleApiKey || process.env.GOOGLE_API_KEY || '';
+  const getClientId = () => userClientId || process.env.GOOGLE_CLIENT_ID || '';
+  const getClientSecret = () => userClientSecret || process.env.GOOGLE_CLIENT_SECRET || '';
 
   // Convert base64 string + mimeType into a browser File object
   const base64ToFile = (base64: string, mimeType: string, filename: string): File => {
@@ -413,7 +425,11 @@ export default function App() {
       const response = await fetch('/api/drive/fetch', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ fileId, tokens: googleTokens })
+        body: JSON.stringify({
+          fileId,
+          tokens: googleTokens,
+          googleApiKey: getGoogleApiKey(),
+        })
       });
       if (!response.ok) {
         const err = await response.json().catch(() => ({ error: response.statusText }));
@@ -1144,17 +1160,46 @@ export default function App() {
     return transcript;
   };
 
-  // Sync editor content
+  // Sync editor content (full rebuild only when segments or transcript change)
   useEffect(() => {
-    if (editorRef.current) {
-      if (isPlaying || document.activeElement !== editorRef.current) {
-        const newContent = renderEditorContent();
-        if (editorRef.current.innerHTML !== newContent) {
-          editorRef.current.innerHTML = newContent;
-        }
-      }
+    if (editorRef.current && document.activeElement !== editorRef.current) {
+      editorRef.current.innerHTML = renderEditorContent();
     }
-  }, [transcript, isPlaying, segments, activeSegmentIndex]);
+  }, [transcript, segments]);
+
+  // Map currentTime → activeSegmentIndex
+  useEffect(() => {
+    if (segments.length === 0) return;
+    const idx = segments.findIndex(
+      (s, i) => currentTime >= s.start && (currentTime < s.end || i === segments.length - 1 && currentTime >= s.start)
+    );
+    // Prefer exact range match
+    const exactIdx = segments.findIndex(s => currentTime >= s.start && currentTime < s.end);
+    const newIdx = exactIdx !== -1 ? exactIdx : (currentTime >= (segments[segments.length - 1]?.start || 0) ? segments.length - 1 : -1);
+    if (newIdx !== activeSegmentIndex) {
+      setActiveSegmentIndex(newIdx);
+    }
+  }, [currentTime, segments]);
+
+  // Fast DOM-only highlight toggle when active segment changes (no innerHTML rebuild)
+  useEffect(() => {
+    if (!editorRef.current || segments.length === 0) return;
+    const activeClass = ['bg-spiritual-accent', 'text-black', 'shadow-[0_0_15px_rgba(212,175,55,0.4)]', 'scale-105', 'z-10'];
+    const inactiveClass = ['opacity-80'];
+    segments.forEach((_, i) => {
+      const el = editorRef.current?.querySelector(`#segment-${i}`) as HTMLElement | null;
+      if (!el) return;
+      if (i === activeSegmentIndex) {
+        activeClass.forEach(c => el.classList.add(c));
+        inactiveClass.forEach(c => el.classList.remove(c));
+        // Auto-scroll the active segment into view
+        el.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+      } else {
+        activeClass.forEach(c => el.classList.remove(c));
+        inactiveClass.forEach(c => el.classList.add(c));
+      }
+    });
+  }, [activeSegmentIndex, segments]);
 
   // Editor Actions
   const handleShare = async () => {
@@ -1371,10 +1416,13 @@ export default function App() {
   }, []);
 
   return (
-    <div className={cn(
-      "min-h-screen transition-colors duration-300 font-sans relative overflow-x-hidden",
-      isDarkMode ? "bg-spiritual-bg text-teal-100/80" : "bg-teal-50 text-teal-900"
-    )}>
+    <div
+      data-theme={isDarkMode ? 'dark' : 'light'}
+      className={cn(
+        "min-h-screen transition-colors duration-300 font-sans relative overflow-x-hidden",
+        isDarkMode ? "bg-spiritual-bg text-teal-100/80" : "bg-[#edf8f8] text-[#0c3336]"
+      )}
+    >
       {/* Animated Glowing Sound Wave Background Overlay */}
       <div className="absolute top-0 left-0 w-full h-40 overflow-hidden z-0 pointer-events-none opacity-70 flex items-end justify-center gap-1 md:gap-2 px-4 blur-[1px] shadow-inner">
         {soundBars.map((bar, i) => {
@@ -1461,66 +1509,79 @@ export default function App() {
             <span className="text-xs font-mono font-bold text-current opacity-80">KALINDU_M</span>
           </div>
 
-          {/* User API Key Button */}
+          {/* Settings Panel — all API keys */}
           <div className="relative">
             <button
-              onClick={() => { setShowApiKeyInput(v => !v); setApiKeyInput(''); }}
+              onClick={() => { setShowSettingsPanel(v => !v); setKeyInputs({ gemini: '', googleApi: '', clientId: '', clientSecret: '' }); }}
               className={cn(
                 "flex items-center gap-2 px-3 py-2 text-[11px] font-mono font-bold uppercase tracking-widest rounded-lg transition-all border",
-                userApiKey
+                (userApiKey || userGoogleApiKey || userClientId || userClientSecret)
                   ? "bg-green-900/30 border-green-500/50 text-green-400"
                   : "bg-teal-800 border-teal-700/40 text-current opacity-70 hover:opacity-100"
               )}
-              title={userApiKey ? "API Key saved — click to change" : "Set your Gemini API Key"}
+              title="API Settings"
             >
               <Sparkles className="w-3 h-3" />
-              {userApiKey ? 'Key Active' : 'API Key'}
-              {userApiKey && <span className="w-1.5 h-1.5 bg-green-400 rounded-full" />}
+              Settings
+              {(userApiKey || userGoogleApiKey || userClientId || userClientSecret) && (
+                <span className="w-1.5 h-1.5 bg-green-400 rounded-full" />
+              )}
             </button>
 
-            {/* Collapsible Key Input Panel */}
             <AnimatePresence>
-              {showApiKeyInput && (
+              {showSettingsPanel && (
                 <motion.div
                   initial={{ opacity: 0, scale: 0.95, y: -6 }}
                   animate={{ opacity: 1, scale: 1, y: 0 }}
                   exit={{ opacity: 0, scale: 0.95, y: -6 }}
-                  className="absolute right-0 top-full mt-2 z-50 w-80 p-4 rounded-xl border border-spiritual-border/60 bg-teal-900 shadow-2xl"
+                  className="absolute right-0 top-full mt-2 z-50 w-96 p-5 rounded-xl border border-spiritual-border/60 bg-teal-900 shadow-2xl"
                 >
-                  <p className="text-[11px] font-mono uppercase tracking-widest opacity-60 mb-3">Gemini API Key</p>
-                  {userApiKey && (
-                    <div className="flex items-center gap-2 mb-3 px-3 py-2 rounded-lg bg-green-900/30 border border-green-500/30">
-                      <span className="w-1.5 h-1.5 bg-green-400 rounded-full flex-shrink-0" />
-                      <span className="text-[11px] font-mono text-green-400 truncate flex-1">
-                        {userApiKey.slice(0, 8)}{'•'.repeat(12)}{userApiKey.slice(-4)}
-                      </span>
-                      <button
-                        onClick={handleClearUserApiKey}
-                        className="text-[10px] font-mono text-red-400 hover:text-red-300 uppercase tracking-widest flex-shrink-0"
-                      >
-                        Clear
-                      </button>
+                  <p className="text-[11px] font-mono font-bold uppercase tracking-widest opacity-60 mb-4">🔑 API Settings</p>
+
+                  {([
+                    { label: 'Gemini API Key', placeholder: 'AIza...', value: userApiKey, inputKey: 'gemini' as const, storageKey: 'dharma_user_api_key', setter: setUserApiKey },
+                    { label: 'Google API Key', placeholder: 'AIza...', value: userGoogleApiKey, inputKey: 'googleApi' as const, storageKey: 'dharma_google_api_key', setter: setUserGoogleApiKey },
+                    { label: 'Google Client ID', placeholder: '123....apps.googleusercontent.com', value: userClientId, inputKey: 'clientId' as const, storageKey: 'dharma_google_client_id', setter: setUserClientId },
+                    { label: 'Google Client Secret', placeholder: 'GOCSPX-...', value: userClientSecret, inputKey: 'clientSecret' as const, storageKey: 'dharma_google_client_secret', setter: setUserClientSecret },
+                  ] as const).map(({ label, placeholder, value, inputKey, storageKey, setter }) => (
+                    <div key={label} className="mb-3">
+                      <div className="flex items-center justify-between mb-1">
+                        <span className="text-[10px] font-mono uppercase tracking-widest opacity-50">{label}</span>
+                        {value && (
+                          <button
+                            onClick={() => clearKey(storageKey, setter)}
+                            className="text-[9px] font-mono text-red-400 hover:text-red-300 uppercase tracking-widest"
+                          >
+                            Clear
+                          </button>
+                        )}
+                      </div>
+                      {value && (
+                        <div className="flex items-center gap-2 mb-1 px-2 py-1 rounded bg-green-900/20 border border-green-500/20">
+                          <span className="w-1.5 h-1.5 bg-green-400 rounded-full flex-shrink-0" />
+                          <span className="text-[10px] font-mono text-green-400 truncate">
+                            {value.slice(0, 8)}{'•'.repeat(10)}{value.slice(-4)}
+                          </span>
+                        </div>
+                      )}
+                      <input
+                        type="password"
+                        value={keyInputs[inputKey]}
+                        onChange={e => setKeyInputs(prev => ({ ...prev, [inputKey]: e.target.value }))}
+                        placeholder={value ? 'Enter new value to replace...' : placeholder}
+                        className="w-full px-3 py-2 bg-teal-800 border border-teal-700/50 rounded-lg font-mono text-xs focus:ring-2 focus:ring-spiritual-accent outline-none placeholder:opacity-25"
+                      />
                     </div>
-                  )}
-                  <div className="flex gap-2">
-                    <input
-                      type="password"
-                      value={apiKeyInput}
-                      onChange={e => setApiKeyInput(e.target.value)}
-                      onKeyDown={e => e.key === 'Enter' && handleSaveUserApiKey()}
-                      placeholder={userApiKey ? 'Enter new key to replace...' : 'AIza...'}
-                      className="flex-1 px-3 py-2 bg-teal-800 border border-teal-700/50 rounded-lg font-mono text-xs focus:ring-2 focus:ring-spiritual-accent outline-none placeholder:opacity-30"
-                      autoFocus
-                    />
-                    <button
-                      onClick={handleSaveUserApiKey}
-                      disabled={!apiKeyInput.trim()}
-                      className="px-3 py-2 bg-spiritual-accent text-black text-[11px] font-mono font-bold uppercase tracking-widest rounded-lg disabled:opacity-40 hover:brightness-110 transition-all"
-                    >
-                      Save
-                    </button>
-                  </div>
-                  <p className="text-[10px] font-mono opacity-40 mt-2">Stored locally in your browser. Never sent to any server.</p>
+                  ))}
+
+                  <button
+                    onClick={handleSaveAllKeys}
+                    disabled={!(Object.values(keyInputs) as string[]).some(v => v.trim())}
+                    className="w-full mt-2 py-2 bg-spiritual-accent text-black text-[11px] font-mono font-bold uppercase tracking-widest rounded-lg disabled:opacity-40 hover:brightness-110 transition-all"
+                  >
+                    Save Keys
+                  </button>
+                  <p className="text-[9px] font-mono opacity-30 mt-2 text-center">Stored locally in your browser only.</p>
                 </motion.div>
               )}
             </AnimatePresence>
