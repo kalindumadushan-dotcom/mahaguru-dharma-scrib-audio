@@ -5,23 +5,23 @@
 
 import { Document, Packer, Paragraph, TextRun } from 'docx';
 import React, { useState, useRef, useEffect } from 'react';
-import { 
-  Upload, 
-  Link as LinkIcon, 
-  Play, 
-  Pause, 
-  RotateCcw, 
-  Copy, 
-  FileText, 
-  FileCode, 
-  Cloud, 
-  Moon, 
-  Sun, 
-  Bold, 
-  Italic, 
-  Underline, 
-  Undo, 
-  Redo, 
+import {
+  Upload,
+  Link as LinkIcon,
+  Play,
+  Pause,
+  RotateCcw,
+  Copy,
+  FileText,
+  FileCode,
+  Cloud,
+  Moon,
+  Sun,
+  Bold,
+  Italic,
+  Underline,
+  Undo,
+  Redo,
   Trash2,
   Sparkles,
   CheckCircle2,
@@ -37,7 +37,8 @@ import {
   Check,
   Zap,
   ZoomIn,
-  ZoomOut
+  ZoomOut,
+  Music
 } from 'lucide-react';
 import WaveSurfer from 'wavesurfer.js';
 import RegionsPlugin from 'wavesurfer.js/dist/plugins/regions.esm.js';
@@ -46,6 +47,7 @@ import { motion, AnimatePresence } from 'framer-motion';
 import { GoogleGenAI } from "@google/genai";
 import { clsx, type ClassValue } from 'clsx';
 import { twMerge } from 'tailwind-merge';
+import * as lamejs from 'lamejs';
 
 // Utility for tailwind classes
 function cn(...inputs: ClassValue[]) {
@@ -62,10 +64,11 @@ export default function App() {
   const [transcript, setTranscript] = useState('');
   const [briefing, setBriefing] = useState('');
   const [isGeneratingBriefing, setIsGeneratingBriefing] = useState(false);
-  const [segments, setSegments] = useState<{start: number, end: number, text: string, type?: string}[]>([]);
+  const [segments, setSegments] = useState<{ start: number, end: number, text: string, type?: string }[]>([]);
   const [isPlaying, setIsPlaying] = useState(false);
   const [isNoiseReductionEnabled, setIsNoiseReductionEnabled] = useState(false);
   const [isVolumeBoosted, setIsVolumeBoosted] = useState(false);
+  const [isMusicIsolated, setIsMusicIsolated] = useState(false);
   const [activeSegmentIndex, setActiveSegmentIndex] = useState<number | null>(null);
   const [currentTime, setCurrentTime] = useState(0);
   const [duration, setDuration] = useState(0);
@@ -73,12 +76,22 @@ export default function App() {
   const [isExporting, setIsExporting] = useState(false);
   const [isSharing, setIsSharing] = useState(false);
   const [isTrimming, setIsTrimming] = useState(false);
-  const [selectedRegion, setSelectedRegion] = useState<{start: number, end: number} | null>(null);
+  const [selectedRegion, setSelectedRegion] = useState<{ start: number, end: number } | null>(null);
   const [isRefining, setIsRefining] = useState(false);
-  const [zoom, setZoom] = useState(0);
+  const [zoom, setZoom] = useState(50);
   const [shareUrl, setShareUrl] = useState('');
   const [hasApiKey, setHasApiKey] = useState(true);
   const [usePaidModel, setUsePaidModel] = useState(false);
+  const [transcribeElapsedTime, setTranscribeElapsedTime] = useState(0);
+  const [estimatedTranscribeTime, setEstimatedTranscribeTime] = useState<number | null>(null);
+  const [transcribeComplete, setTranscribeComplete] = useState(false);
+  // localStorage key stores seconds-per-audio-second for self-correcting estimate
+  const savedRateKey = 'dharma_scribe_transcribe_rate';
+  const getSavedRate = () => parseFloat(localStorage.getItem(savedRateKey) || '0') || null;
+  const [userApiKey, setUserApiKey] = useState<string>(() => localStorage.getItem('dharma_user_api_key') || '');
+  const [apiKeyInput, setApiKeyInput] = useState('');
+  const [showApiKeyInput, setShowApiKeyInput] = useState(false);
+  const [isFetchingDrive, setIsFetchingDrive] = useState(false);
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const editorRef = useRef<HTMLDivElement | null>(null);
   const recognitionRef = useRef<any>(null);
@@ -114,52 +127,155 @@ export default function App() {
 
   const handleTrim = async () => {
     if (!wavesurferRef.current || !selectedRegion || !audioFile) return;
-    
+
     setIsTrimming(true);
     try {
       const audioContext = new AudioContext();
       const arrayBuffer = await audioFile.arrayBuffer();
       const audioBuffer = await audioContext.decodeAudioData(arrayBuffer);
-      
+
       const start = selectedRegion.start;
       const end = selectedRegion.end;
-      const duration = end - start;
+      const originalDuration = audioBuffer.duration;
+      const newDuration = originalDuration - (end - start);
       const sampleRate = audioBuffer.sampleRate;
-      
+
       const newBuffer = audioContext.createBuffer(
         audioBuffer.numberOfChannels,
-        Math.floor(duration * sampleRate),
+        Math.floor(newDuration * sampleRate),
         sampleRate
       );
-      
+
       for (let i = 0; i < audioBuffer.numberOfChannels; i++) {
         const channelData = audioBuffer.getChannelData(i);
         const newChannelData = newBuffer.getChannelData(i);
-        const startOffset = Math.floor(start * sampleRate);
-        for (let j = 0; j < newChannelData.length; j++) {
-          newChannelData[j] = channelData[startOffset + j];
+
+        const part1Samples = Math.floor(start * sampleRate);
+        for (let j = 0; j < part1Samples; j++) {
+          newChannelData[j] = channelData[j];
+        }
+
+        const part2StartSample = Math.floor(end * sampleRate);
+        const part2Samples = channelData.length - part2StartSample;
+        for (let j = 0; j < part2Samples; j++) {
+          if ((part1Samples + j) < newChannelData.length) {
+            newChannelData[part1Samples + j] = channelData[part2StartSample + j];
+          }
         }
       }
-      
-      // Convert AudioBuffer to Blob
-      const wavBlob = await audioBufferToWavBlob(newBuffer);
-      const newFile = new File([wavBlob], `trimmed_${audioFile.name}`, { type: 'audio/wav' });
-      
+
+      // Purify and Convert AudioBuffer to MP3 Blob
+      const purifiedBuffer = await applyFiltersToBuffer(newBuffer);
+      const mp3Blob = await audioBufferToMp3Blob(purifiedBuffer);
+      const baseName = audioFile.name.replace(/\.[^/.]+$/, "");
+      const newFile = new File([mp3Blob], `purified_trimmed_${baseName}.mp3`, { type: 'audio/mp3' });
+
       setAudioFile(newFile);
       if (audioRef.current) {
         audioRef.current.src = URL.createObjectURL(newFile);
       }
-      
+
       // Clear regions
       const regions = (wavesurferRef.current as any).plugins.find((p: any) => p instanceof RegionsPlugin);
       if (regions) regions.clearRegions();
       setSelectedRegion(null);
-      
+
     } catch (error) {
       console.error('Trim error:', error);
     } finally {
       setIsTrimming(false);
     }
+  };
+
+  const applyFiltersToBuffer = async (buffer: AudioBuffer): Promise<AudioBuffer> => {
+    if (!isNoiseReductionEnabled && !isVolumeBoosted) return buffer;
+
+    const offlineCtx = new OfflineAudioContext(
+      buffer.numberOfChannels,
+      buffer.length,
+      buffer.sampleRate
+    );
+
+    const source = offlineCtx.createBufferSource();
+    source.buffer = buffer;
+
+    let lastNode: AudioNode = source;
+
+    if (isNoiseReductionEnabled) {
+      const hp = offlineCtx.createBiquadFilter();
+      hp.type = 'highpass';
+      hp.frequency.value = 150;
+
+      const lp = offlineCtx.createBiquadFilter();
+      lp.type = 'lowpass';
+      lp.frequency.value = 7000;
+
+      const peak = offlineCtx.createBiquadFilter();
+      peak.type = 'peaking';
+      peak.frequency.value = 3000;
+      peak.Q.value = 1;
+      peak.gain.value = 5;
+
+      lastNode.connect(hp);
+      hp.connect(lp);
+      lp.connect(peak);
+      lastNode = peak;
+    }
+
+    const gain = offlineCtx.createGain();
+    gain.gain.value = isVolumeBoosted ? 2.5 : 1.0;
+
+    lastNode.connect(gain);
+    gain.connect(offlineCtx.destination);
+
+    source.start(0);
+    return await offlineCtx.startRendering();
+  };
+
+  const audioBufferToMp3Blob = async (buffer: AudioBuffer): Promise<Blob> => {
+    return new Promise((resolve) => {
+      const channels = buffer.numberOfChannels;
+      const sampleRate = buffer.sampleRate;
+      const mp3encoder = new lamejs.Mp3Encoder(channels, sampleRate, 128);
+      const mp3Data: Int8Array[] = [];
+
+      const sampleBlockSize = 1152;
+      const left = buffer.getChannelData(0);
+      const right = channels > 1 ? buffer.getChannelData(1) : left;
+
+      const floatToInt16 = (f32Array: Float32Array) => {
+        let i16 = new Int16Array(f32Array.length);
+        for (let i = 0; i < f32Array.length; i++) {
+          let s = Math.max(-1, Math.min(1, f32Array[i]));
+          i16[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+        }
+        return i16;
+      };
+
+      const leftInt16 = floatToInt16(left);
+      const rightInt16 = floatToInt16(right);
+
+      for (let i = 0; i < leftInt16.length; i += sampleBlockSize) {
+        const leftChunk = leftInt16.subarray(i, i + sampleBlockSize);
+        const rightChunk = rightInt16.subarray(i, i + sampleBlockSize);
+
+        const mp3buf = channels === 2
+          ? mp3encoder.encodeBuffer(leftChunk, rightChunk)
+          : mp3encoder.encodeBuffer(leftChunk);
+
+        if (mp3buf.length > 0) {
+          mp3Data.push(mp3buf);
+        }
+      }
+
+      const mp3buf = mp3encoder.flush();
+      if (mp3buf.length > 0) {
+        mp3Data.push(mp3buf);
+      }
+
+      const blob = new Blob(mp3Data, { type: 'audio/mp3' });
+      resolve(blob);
+    });
   };
 
   const audioBufferToWavBlob = (buffer: AudioBuffer): Promise<Blob> => {
@@ -219,12 +335,12 @@ export default function App() {
 
   const handleRefine = async () => {
     if (!selectedRegion || !transcript) return;
-    
+
     setIsRefining(true);
     try {
       const apiKey = getApiKey();
       if (!apiKey) return;
-      
+
       const ai = new GoogleGenAI({ apiKey });
       const response = await ai.models.generateContent({
         model: "gemini-3-flash-latest",
@@ -236,16 +352,16 @@ export default function App() {
           systemInstruction: "You are an expert audio editor and transcription refiner. Refine the following transcript segment for clarity, grammar, and professional tone while maintaining the original meaning.",
         }
       });
-      
+
       const refinedText = response.text;
-      
+
       // Replace the segment in the transcript
       const startIdx = Math.floor((selectedRegion.start / duration) * transcript.length);
       const endIdx = Math.floor((selectedRegion.end / duration) * transcript.length);
-      
+
       const newTranscript = transcript.substring(0, startIdx) + refinedText + transcript.substring(endIdx);
       setTranscript(newTranscript);
-      
+
     } catch (error) {
       console.error('Refine error:', error);
     } finally {
@@ -254,9 +370,67 @@ export default function App() {
   };
 
   const getApiKey = () => {
+    // User-supplied key takes priority over environment variable
+    if (userApiKey && userApiKey !== 'undefined' && userApiKey !== 'null') return userApiKey;
     const key = process.env.GEMINI_API_KEY || (process.env as any).API_KEY;
     if (!key || key === 'undefined' || key === 'null') return '';
     return key;
+  };
+
+  const handleSaveUserApiKey = () => {
+    const trimmed = apiKeyInput.trim();
+    if (trimmed) {
+      localStorage.setItem('dharma_user_api_key', trimmed);
+      setUserApiKey(trimmed);
+      setApiKeyInput('');
+      setShowApiKeyInput(false);
+    }
+  };
+
+  const handleClearUserApiKey = () => {
+    localStorage.removeItem('dharma_user_api_key');
+    setUserApiKey('');
+    setApiKeyInput('');
+  };
+
+  // Convert base64 string + mimeType into a browser File object
+  const base64ToFile = (base64: string, mimeType: string, filename: string): File => {
+    const byteChars = atob(base64);
+    const byteArr = new Uint8Array(byteChars.length);
+    for (let i = 0; i < byteChars.length; i++) byteArr[i] = byteChars.charCodeAt(i);
+    return new File([byteArr], filename, { type: mimeType });
+  };
+
+  const handleFetchDriveAudio = async () => {
+    if (!driveLink) return;
+    const fileId = extractDriveFileId(driveLink);
+    if (!fileId) {
+      alert('කරුණාකර වලංගු Google Drive ලින්ක් එකක් ඇතුළත් කරන්න.');
+      return;
+    }
+    setIsFetchingDrive(true);
+    try {
+      const response = await fetch('/api/drive/fetch', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ fileId, tokens: googleTokens })
+      });
+      if (!response.ok) {
+        const err = await response.json().catch(() => ({ error: response.statusText }));
+        throw new Error(err.error || 'Failed to fetch file from Drive');
+      }
+      const result = await response.json();
+      const ext = (result.mimeType || 'audio/mpeg').split('/')[1]?.split(';')[0] || 'mp3';
+      const filename = result.name || `drive_audio.${ext}`;
+      const file = base64ToFile(result.data, result.mimeType || 'audio/mpeg', filename);
+      setAudioFile(file);
+      setActiveTab('upload'); // Show all audio controls
+    } catch (error: any) {
+      console.error('Drive fetch error:', error);
+      alert(`ගොනුව බාගත කිරීම අසාර්ථක විය: ${error.message}\n\nකරුණාකර Google Drive ගොනුව "Anyone with the link" ලෙස Public කරන්න.`);
+    } finally {
+      setIsFetchingDrive(false);
+    }
   };
 
   // Initialize Speech Recognition
@@ -386,6 +560,10 @@ export default function App() {
     if (!audioContextRef.current) updateAudioGraph();
   };
 
+  const toggleMusicIsolation = () => {
+    setIsMusicIsolated(!isMusicIsolated);
+  };
+
   const clearAudio = () => {
     setAudioFile(null);
     setDriveLink('');
@@ -395,6 +573,18 @@ export default function App() {
     if (audioRef.current) {
       audioRef.current.src = '';
     }
+  };
+
+  const handleDownloadAudio = () => {
+    if (!audioFile) return;
+    const url = URL.createObjectURL(audioFile);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = audioFile.name;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
   };
   const toggleListening = () => {
     if (isListening) {
@@ -413,6 +603,40 @@ export default function App() {
       }
     };
   }, []);
+
+  // Transcription elapsed timer + self-correcting estimate
+  useEffect(() => {
+    let interval: ReturnType<typeof setInterval>;
+    if (isTranscribing) {
+      setTranscribeComplete(false);
+      setTranscribeElapsedTime(0);
+
+      // Build estimate: use saved historical rate if available, else fall back to 0.5×
+      if (duration > 0) {
+        const savedRate = getSavedRate();
+        const rate = savedRate ?? 0.5;
+        const estimate = Math.max(10, Math.round(duration * rate));
+        setEstimatedTranscribeTime(estimate);
+      } else {
+        setEstimatedTranscribeTime(null);
+      }
+
+      interval = setInterval(() => {
+        setTranscribeElapsedTime(prev => prev + 1);
+      }, 1000);
+    } else if (transcribeElapsedTime > 0) {
+      // Transcription just finished — freeze the timer and self-correct rate
+      setTranscribeComplete(true);
+      if (duration > 0 && transcribeElapsedTime > 0) {
+        const newRate = transcribeElapsedTime / duration;
+        // Blend with previous rate (exponential moving average) for stability
+        const savedRate = getSavedRate();
+        const blendedRate = savedRate ? savedRate * 0.4 + newRate * 0.6 : newRate;
+        localStorage.setItem(savedRateKey, blendedRate.toFixed(4));
+      }
+    }
+    return () => clearInterval(interval);
+  }, [isTranscribing]);
 
   // Theme management
   useEffect(() => {
@@ -459,20 +683,24 @@ export default function App() {
   // Sync Current Time for highlighting
   useEffect(() => {
     let animationFrameId: number;
-    
+
     const updateSync = () => {
-      if (wavesurferRef.current && isPlaying) {
-        const time = wavesurferRef.current.getCurrentTime();
+      if (audioRef.current && isPlaying) {
+        const time = audioRef.current.currentTime;
         setCurrentTime(time);
-        
-        // Find active segment
-        const index = segments.findIndex(s => time >= s.start && time <= s.end);
-        if (index !== -1 && index !== activeSegmentIndex) {
-          setActiveSegmentIndex(index);
-        } else if (index === -1 && activeSegmentIndex !== null) {
-          setActiveSegmentIndex(null);
+
+        let index = segments.findIndex((s) => time >= s.start && time <= s.end);
+
+        if (index === -1 && segments.length > 0) {
+          for (let i = segments.length - 1; i >= 0; i--) {
+            if (time >= segments[i].end && time - segments[i].end < 1.0) {
+              index = i;
+              break;
+            }
+          }
         }
-        
+
+        setActiveSegmentIndex(index === -1 ? null : index);
         animationFrameId = requestAnimationFrame(updateSync);
       }
     };
@@ -486,7 +714,7 @@ export default function App() {
         cancelAnimationFrame(animationFrameId);
       }
     };
-  }, [isPlaying, segments, activeSegmentIndex]);
+  }, [isPlaying, segments]);
 
   // Initialize WaveSurfer
   useEffect(() => {
@@ -510,7 +738,7 @@ export default function App() {
     regions.enableDragSelection({
       color: 'rgba(212, 175, 55, 0.2)',
     });
-    
+
     regions.on('region-updated', (region) => {
       setSelectedRegion({ start: region.start, end: region.end });
     });
@@ -577,7 +805,7 @@ export default function App() {
             case 'inappropriate': color = 'rgba(239, 68, 68, 0.4)'; break; // Red
             case 'silence': color = 'rgba(107, 114, 128, 0.4)'; break; // Gray
           }
-          
+
           regionsRef.current.addRegion({
             start: segment.start,
             end: segment.end,
@@ -591,57 +819,7 @@ export default function App() {
     }
   }, [segments]);
 
-  // Sync WaveSurfer with audio source
-  useEffect(() => {
-    if (audioFile && wavesurferRef.current) {
-      const url = URL.createObjectURL(audioFile);
-      wavesurferRef.current.load(url);
-      return () => URL.revokeObjectURL(url);
-    }
-  }, [audioFile]);
 
-  // Sync Playback State
-  useEffect(() => {
-    if (wavesurferRef.current) {
-      if (isPlaying) {
-        wavesurferRef.current.play();
-      } else {
-        wavesurferRef.current.pause();
-      }
-    }
-  }, [isPlaying]);
-
-  // Sync Current Time for highlighting
-  useEffect(() => {
-    let animationFrameId: number;
-    
-    const updateSync = () => {
-      if (wavesurferRef.current && isPlaying) {
-        const time = wavesurferRef.current.getCurrentTime();
-        setCurrentTime(time);
-        
-        // Find active segment
-        const index = segments.findIndex(s => time >= s.start && time <= s.end);
-        if (index !== -1 && index !== activeSegmentIndex) {
-          setActiveSegmentIndex(index);
-        } else if (index === -1 && activeSegmentIndex !== null) {
-          setActiveSegmentIndex(null);
-        }
-        
-        animationFrameId = requestAnimationFrame(updateSync);
-      }
-    };
-
-    if (isPlaying) {
-      animationFrameId = requestAnimationFrame(updateSync);
-    }
-
-    return () => {
-      if (animationFrameId) {
-        cancelAnimationFrame(animationFrameId);
-      }
-    };
-  }, [isPlaying, segments, activeSegmentIndex]);
 
   // Dropzone setup
   const { getRootProps, getInputProps, isDragActive } = useDropzone({
@@ -657,37 +835,7 @@ export default function App() {
     }
   } as any);
 
-  // Audio Player Logic with high-frequency sync
-  useEffect(() => {
-    let animationFrameId: number;
-    
-    const updateSync = () => {
-      if (audioRef.current && isPlaying) {
-        const time = audioRef.current.currentTime;
-        setCurrentTime(time);
-        
-        // Find active segment
-        const index = segments.findIndex(s => time >= s.start && time <= s.end);
-        if (index !== -1 && index !== activeSegmentIndex) {
-          setActiveSegmentIndex(index);
-        } else if (index === -1 && activeSegmentIndex !== null) {
-          setActiveSegmentIndex(null);
-        }
-        
-        animationFrameId = requestAnimationFrame(updateSync);
-      }
-    };
 
-    if (isPlaying) {
-      animationFrameId = requestAnimationFrame(updateSync);
-    }
-
-    return () => {
-      if (animationFrameId) {
-        cancelAnimationFrame(animationFrameId);
-      }
-    };
-  }, [isPlaying, segments, activeSegmentIndex]);
 
   useEffect(() => {
     if (audioFile) {
@@ -785,7 +933,7 @@ export default function App() {
       }
 
       const ai = new GoogleGenAI({ apiKey });
-      
+
       let audioData = '';
       let mimeType = '';
 
@@ -801,6 +949,7 @@ export default function App() {
           reader.readAsDataURL(audioFile);
         });
       } else if (driveLink) {
+        // Audio not yet fetched locally — fetch it now, set as audioFile and read from it
         const fileId = extractDriveFileId(driveLink);
         if (!fileId) throw new Error('වලංගු Google Drive ලින්ක් එකක් ඇතුළත් කරන්න.');
         const response = await fetch('/api/drive/fetch', {
@@ -808,13 +957,11 @@ export default function App() {
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ fileId, tokens: googleTokens })
         });
-        
+
         if (!response.ok) {
           const errorText = await response.text();
           let errorJson;
-          try {
-            errorJson = JSON.parse(errorText);
-          } catch (e) {
+          try { errorJson = JSON.parse(errorText); } catch (e) {
             throw new Error(`Server error (${response.status}): ${errorText.substring(0, 100)}`);
           }
           throw new Error(errorJson.error || `Server error (${response.status})`);
@@ -823,6 +970,12 @@ export default function App() {
         const result = await response.json();
         audioData = result.data;
         mimeType = result.mimeType;
+
+        // Also hydrate audioFile so playback / trim work after transcription
+        const ext = (result.mimeType || 'audio/mpeg').split('/')[1]?.split(';')[0] || 'mp3';
+        const filename = result.name || `drive_audio.${ext}`;
+        const fetchedFile = base64ToFile(result.data, result.mimeType || 'audio/mpeg', filename);
+        setAudioFile(fetchedFile);
       }
 
       // Check base64 size (roughly)
@@ -832,9 +985,9 @@ export default function App() {
       }
 
       const response = await ai.models.generateContent({
-        model: usePaidModel ? "gemini-3.1-flash-preview" : "gemini-3-flash-preview", 
+        model: usePaidModel ? "gemini-3.1-flash-preview" : "gemini-3-flash-preview",
         config: {
-          systemInstruction: "You are a professional transcriptionist and audio analyst. Your task is to transcribe the provided audio accurately and identify specific elements. The audio contains mixed Sinhala and English speech. Use Sinhala script for Sinhala words and English script for English words. Provide extremely precise timestamps for every short phrase (2-5 words). Accuracy in timing is critical for synchronization.\n\nAdditionally, identify the following elements and mark them with a 'type' field:\n- 'name': Proper names of people, places, or organizations.\n- 'slang': Informal or slang words.\n- 'inappropriate': Profane, offensive, or inappropriate language.\n- 'silence': Periods of silence longer than 2 seconds (use text: '[SILENCE]').\n- 'normal': Regular speech.\n\nReturn the transcription as a JSON array of objects with 'start' (number), 'end' (number), 'text' (string), and 'type' (string) fields. Ensure the JSON is valid and follows the schema exactly.",
+          systemInstruction: `You are a professional transcriptionist and audio analyst. Your task is to transcribe the provided audio accurately and identify specific elements. The audio contains mixed Sinhala and English speech. Use Sinhala script for Sinhala words and English script for English words. Provide extremely precise timestamps for every short phrase (2-5 words). Accuracy in timing is critical for synchronization.\n\nAdditionally, identify the following elements and mark them with a 'type' field:\n- 'name': Proper names of people, places, or organizations.\n- 'slang': Informal or slang words.\n- 'inappropriate': Profane, offensive, or inappropriate language.\n- 'silence': Periods of silence longer than 2 seconds (use text: '.............').\n- 'normal': Regular speech.\n\nReturn the transcription as a JSON array of objects with 'start' (number), 'end' (number), 'text' (string), and 'type' (string) fields. Ensure the JSON is valid and follows the schema exactly.${isMusicIsolated ? '\n\nCRITICAL WARNING: The source audio contains background music or songs. You MUST heavily filter out and ignore any background singing, melodies, or lyrics. ONLY transcribe the primary spoken foreground dialogue.' : ''}`,
           responseMimeType: "application/json",
           responseSchema: {
             type: "ARRAY",
@@ -859,56 +1012,57 @@ export default function App() {
 
       const result = JSON.parse(response.text || '[]');
       setSegments(result);
-      
+
       // Generate highlighted HTML for the transcript
       const highlightedHtml = result.map((s: any) => {
         let color = '';
         let title = '';
         switch (s.type) {
-          case 'name': 
-            color = 'bg-blue-200 dark:bg-blue-900/40 text-blue-800 dark:text-blue-200'; 
-            title = 'Name Detected'; 
+          case 'name':
+            color = 'bg-blue-200 dark:bg-blue-900/40 text-blue-800 dark:text-blue-200';
+            title = 'Name Detected';
             break;
-          case 'slang': 
-            color = 'bg-green-200 dark:bg-green-900/40 text-green-800 dark:text-green-200'; 
-            title = 'Slang Detected'; 
+          case 'slang':
+            color = 'bg-green-200 dark:bg-green-900/40 text-green-800 dark:text-green-200';
+            title = 'Slang Detected';
             break;
-          case 'inappropriate': 
-            color = 'bg-red-200 dark:bg-red-900/40 text-red-800 dark:text-red-200'; 
-            title = 'Inappropriate Language'; 
+          case 'inappropriate':
+            color = 'bg-red-200 dark:bg-red-900/40 text-red-800 dark:text-red-200';
+            title = 'Inappropriate Language';
             break;
-          case 'silence': 
-            color = 'bg-gray-200 dark:bg-gray-900/40 text-gray-800 dark:text-gray-200 italic opacity-50'; 
-            title = 'Long Silence'; 
+          case 'silence':
+            color = 'bg-gray-200 dark:bg-gray-900/40 text-gray-800 dark:text-gray-200 italic opacity-50';
+            title = 'Long Silence';
             break;
         }
-        
+
+        const displayText = s.type === 'silence' ? '.............' : s.text;
         if (color) {
-          return `<span class="${color} px-1 rounded transition-all cursor-pointer inline-block my-0.5" title="${title}" onclick="window.seekTo(${s.start})">${s.text}</span>`;
+          return `<span class="${color} px-1 rounded transition-all cursor-pointer inline-block my-0.5" title="${title}" onclick="window.seekTo(${s.start})">${displayText}</span>`;
         }
-        return s.text;
+        return displayText;
       }).join(' ');
-      
+
       setTranscript(highlightedHtml);
       if (editorRef.current) {
         editorRef.current.innerHTML = highlightedHtml;
       }
-      
+
       // Generate Briefing
       const fullText = result.map((s: any) => s.text).join(' ');
       generateBriefing(fullText);
     } catch (error: any) {
       console.error('Transcription error:', error);
       const errorMsg = (error.message || String(error)).toLowerCase();
-      
+
       if (errorMsg.includes('failed to fetch')) {
         alert('ජාල සම්බන්ධතාවයේ දෝෂයක් (Failed to fetch). කරුණාකර ඔබගේ අන්තර්ජාලය පරීක්ෂා කරන්න හෝ වෙනත් Browser එකකින් උත්සාහ කරන්න. සමහර විට Ad-blockers මඟින් මෙය වැළැක්විය හැක.');
         return;
       }
 
       if (
-        errorMsg.includes('api key not valid') || 
-        errorMsg.includes('invalid_argument') || 
+        errorMsg.includes('api key not valid') ||
+        errorMsg.includes('invalid_argument') ||
         errorMsg.includes('requested entity was not found') ||
         errorMsg.includes('api_key_invalid') ||
         errorMsg.includes('unauthorized')
@@ -945,7 +1099,7 @@ export default function App() {
       if (!apiKey) return;
       const ai = new GoogleGenAI({ apiKey });
       const response = await ai.models.generateContent({
-        model: "gemini-3.1-flash-preview",
+        model: usePaidModel ? "gemini-3.1-flash-preview" : "gemini-3-flash-preview",
         config: {
           systemInstruction: "You are a professional summarizer. Your task is to summarize the following transcribed text into a concise briefing in Sinhala. Highlight the key points and main topics discussed.",
         },
@@ -973,17 +1127,17 @@ export default function App() {
       return segments.map((segment, index) => {
         const isActive = activeSegmentIndex === index;
         const colorClass = segment.type === 'name' ? 'bg-blue-500/20 text-blue-300 border-blue-500/30' :
-                          segment.type === 'slang' ? 'bg-green-500/20 text-green-300 border-green-500/30' :
-                          segment.type === 'inappropriate' ? 'bg-red-500/20 text-red-300 border-red-500/30' :
-                          segment.type === 'silence' ? 'bg-gray-500/20 text-gray-300 border-gray-500/30' :
-                          '';
-        
+          segment.type === 'slang' ? 'bg-green-500/20 text-green-300 border-green-500/30' :
+            segment.type === 'inappropriate' ? 'bg-red-500/20 text-red-300 border-red-500/30' :
+              segment.type === 'silence' ? 'bg-gray-500/20 text-gray-300 border-gray-500/30' :
+                '';
+
         return `<span 
           id="segment-${index}"
-          class="transition-all duration-300 rounded px-1 py-0.5 inline-block cursor-pointer hover:bg-amber-900/5 ${isActive ? 'bg-spiritual-accent text-black shadow-[0_0_15px_rgba(212,175,55,0.4)] scale-105 z-10' : 'opacity-80'} ${colorClass}"
+          class="transition-all duration-300 rounded px-1 py-0.5 inline-block cursor-pointer hover:bg-teal-800 ${isActive ? 'bg-spiritual-accent text-black shadow-[0_0_15px_rgba(212,175,55,0.4)] scale-105 z-10' : 'opacity-80'} ${colorClass}"
           onclick="seekTo(${segment.start})"
           title="${segment.type ? segment.type.toUpperCase() : ''}"
-        >${segment.text}</span>`;
+        >${segment.type === 'silence' ? '.............' : segment.text}</span>`;
       }).join(' ');
     }
 
@@ -1070,10 +1224,15 @@ export default function App() {
 
   const handleExportTxt = () => {
     if (editorRef.current) {
+      const audioName = audioFile?.name || 'Audio Transcript';
+      const summarySection = briefing ? `Generated Summary\n${'-'.repeat(40)}\n${briefing}\n\n` : '';
+      const transcriptSection = `Transcribed Text\n${'-'.repeat(40)}\n${editorRef.current.innerText}`;
+      const fullContent = `${audioName}\n${'='.repeat(audioName.length)}\n\n${summarySection}${transcriptSection}`;
+
       const element = document.createElement("a");
-      const file = new Blob([editorRef.current.innerText], {type: 'text/plain'});
+      const file = new Blob([fullContent], { type: 'text/plain' });
       element.href = URL.createObjectURL(file);
-      element.download = "transcript.txt";
+      element.download = `${audioName.replace(/\.[^/.]+$/, '') || 'transcript'}.txt`;
       document.body.appendChild(element);
       element.click();
     }
@@ -1081,24 +1240,78 @@ export default function App() {
 
   const handleExportDocx = async () => {
     if (!editorRef.current) return;
-    
-    const doc = new Document({
-      sections: [{
-        properties: {},
+
+    const audioName = audioFile?.name || 'Audio Transcript';
+    const children: (Paragraph)[] = [];
+
+    // 1. Audio Name — Bold Title
+    children.push(
+      new Paragraph({
         children: [
-          new Paragraph({
-            children: [
-              new TextRun(editorRef.current.innerText),
-            ],
+          new TextRun({
+            text: audioName,
+            bold: true,
+            size: 36,
           }),
         ],
-      }],
+        spacing: { after: 300 },
+      })
+    );
+
+    // 2. Generated Summary
+    if (briefing) {
+      children.push(
+        new Paragraph({
+          children: [
+            new TextRun({
+              text: 'Generated Summary',
+              bold: true,
+              size: 26,
+            }),
+          ],
+          spacing: { before: 200, after: 120 },
+        })
+      );
+      briefing.split('\n').forEach(line => {
+        children.push(
+          new Paragraph({
+            children: [new TextRun({ text: line, size: 22 })],
+            spacing: { after: 80 },
+          })
+        );
+      });
+    }
+
+    // 3. Transcribed Text
+    children.push(
+      new Paragraph({
+        children: [
+          new TextRun({
+            text: 'Transcribed Text',
+            bold: true,
+            size: 26,
+          }),
+        ],
+        spacing: { before: 300, after: 120 },
+      })
+    );
+    editorRef.current.innerText.split('\n').forEach(line => {
+      children.push(
+        new Paragraph({
+          children: [new TextRun({ text: line, size: 22 })],
+          spacing: { after: 80 },
+        })
+      );
+    });
+
+    const doc = new Document({
+      sections: [{ properties: {}, children }],
     });
 
     const blob = await Packer.toBlob(doc);
     const element = document.createElement("a");
     element.href = URL.createObjectURL(blob);
-    element.download = "transcript.docx";
+    element.download = `${audioName.replace(/\.[^/.]+$/, '') || 'transcript'}.docx`;
     document.body.appendChild(element);
     element.click();
   };
@@ -1119,13 +1332,20 @@ export default function App() {
 
     setIsExporting(true);
     try {
+      const audioName = audioFile?.name || 'Audio Transcript';
+      const summarySection = briefing
+        ? `Generated Summary\n${'—'.repeat(30)}\n${briefing}\n\n`
+        : '';
+      const transcriptSection = `Transcribed Text\n${'—'.repeat(30)}\n${editorRef.current?.innerText || ''}`;
+      const fullContent = `${summarySection}${transcriptSection}`;
+
       const response = await fetch('/api/export/google-docs', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           tokens,
-          title: `Transcript - ${new Date().toLocaleString()}`,
-          content: editorRef.current?.innerText || ''
+          title: audioName,
+          content: fullContent
         })
       });
       const data = await response.json();
@@ -1142,44 +1362,75 @@ export default function App() {
     }
   };
 
+  const soundBars = React.useMemo(() => {
+    return Array.from({ length: 70 }).map(() => ({
+      height: Math.max(15, Math.random() * 100),
+      delay: Math.random() * 1.5,
+      duration: 0.6 + Math.random() * 0.8
+    }));
+  }, []);
+
   return (
     <div className={cn(
-      "min-h-screen transition-colors duration-300 font-sans",
-      isDarkMode ? "bg-spiritual-bg text-amber-100/80" : "bg-amber-50 text-amber-900"
+      "min-h-screen transition-colors duration-300 font-sans relative overflow-x-hidden",
+      isDarkMode ? "bg-spiritual-bg text-teal-100/80" : "bg-teal-50 text-teal-900"
     )}>
+      {/* Animated Glowing Sound Wave Background Overlay */}
+      <div className="absolute top-0 left-0 w-full h-40 overflow-hidden z-0 pointer-events-none opacity-70 flex items-end justify-center gap-1 md:gap-2 px-4 blur-[1px] shadow-inner">
+        {soundBars.map((bar, i) => {
+          // Smooth color transition from edge Teal to center Gold
+          const distFromCenter = Math.abs(35 - i);
+          const bgClass = distFromCenter < 12
+            ? "bg-spiritual-accent shadow-[0_0_15px_rgba(250,204,21,0.6)]"
+            : distFromCenter < 25
+              ? "bg-spiritual-border"
+              : "bg-teal-700/50";
+          return (
+            <div
+              key={i}
+              className={cn("w-2 md:w-3 rounded-t-full animate-sound-bounce transition-colors", bgClass)}
+              style={{
+                height: `${bar.height}%`,
+                animationDelay: `${bar.delay}s`,
+                animationDuration: `${bar.duration}s`
+              }}
+            />
+          );
+        })}
+      </div>
+
       {/* Header */}
-      <header className="max-w-7xl mx-auto px-6 py-10 flex justify-between items-center border-b border-spiritual-border/50">
+      <header className="max-w-7xl mx-auto px-6 py-10 flex justify-between items-center border-b border-spiritual-border/50 relative z-10">
         <div className="flex items-center gap-4">
           <div className="relative">
-            <div className="w-14 h-14 bg-spiritual-accent rounded-full flex items-center justify-center shadow-[0_0_30px_rgba(212,175,55,0.3)] zen-pulse">
-              <Sparkles className="text-black w-8 h-8" />
+            <div className="w-20 h-20 rounded-full flex items-center justify-center shadow-[0_15px_40px_rgba(0,0,0,0.7)] overflow-hidden bg-white/5 border border-spiritual-border/50 transition-all hover:scale-105">
+              <img src="/logo.jpg" alt="Mahaguru Dharma Logo" className="w-full h-full object-cover scale-[1.1]" />
             </div>
-            <div className="absolute -top-1 -right-1 w-3 h-3 bg-spiritual-accent rounded-full border-2 border-spiritual-bg animate-pulse" />
           </div>
           <div>
             <h1 className={cn(
               "text-3xl font-display font-bold tracking-tight",
-              isDarkMode ? "text-amber-100" : "text-amber-900"
+              isDarkMode ? "text-teal-100" : "text-teal-900"
             )}>
               MAHAGURU CENTER <span className="text-spiritual-accent">DHARMA SCRIBE</span>
             </h1>
             <div className="flex items-center gap-2 mt-1">
               <Leaf className="w-3 h-3 text-spiritual-accent/60" />
-              <p className="text-[10px] font-mono uppercase tracking-[0.2em] text-spiritual-accent/80">Serene Processing // v2.5.0</p>
+              <p className="text-[12px] font-mono uppercase tracking-[0.2em] text-spiritual-accent/80">Serene Processing // v2.5.0</p>
             </div>
           </div>
         </div>
-        
+
         <div className="flex items-center gap-4">
           {(window as any).aistudio?.openSelectKey && (
             <div className="flex items-center gap-2">
-              <button 
+              <button
                 onClick={() => setUsePaidModel(!usePaidModel)}
                 className={cn(
-                  "flex items-center gap-2 px-4 py-2 text-[10px] font-mono font-bold uppercase tracking-widest rounded-lg transition-all border",
-                  usePaidModel 
-                    ? "bg-spiritual-accent/20 border-spiritual-accent text-spiritual-accent" 
-                    : "bg-amber-900/5 border-amber-900/10 text-amber-600/40 hover:border-amber-900/20"
+                  "flex items-center gap-2 px-4 py-2 text-[12px] font-mono font-bold uppercase tracking-widest rounded-lg transition-all border",
+                  usePaidModel
+                    ? "bg-spiritual-accent/20 border-spiritual-accent text-spiritual-accent"
+                    : "bg-teal-800 border-teal-900/10 text-current opacity-60 hover:border-teal-900/20"
                 )}
                 title={usePaidModel ? "Using Gemini 3.1 Flash (Advanced)" : "Using Gemini 3 Flash (Standard)"}
               >
@@ -1187,16 +1438,16 @@ export default function App() {
                 {usePaidModel ? "Advanced (Paid)" : "Standard (Free)"}
               </button>
               <div className="hidden lg:flex flex-col">
-                <span className="text-[8px] font-mono text-amber-600/40 uppercase tracking-tighter">
+                <span className="text-[10px] font-mono text-current opacity-60 uppercase tracking-tighter">
                   {usePaidModel ? "Gemini 3.1 Flash (High Precision)" : "Gemini 3 Flash (Standard)"}
                 </span>
               </div>
-              <button 
+              <button
                 onClick={handleSetApiKey}
                 className={cn(
-                  "flex items-center gap-2 px-4 py-2 text-[10px] font-mono font-bold uppercase tracking-widest rounded-lg transition-all border",
-                  hasApiKey 
-                    ? "bg-amber-900/5 border-amber-900/10 text-amber-600/60 hover:border-amber-900/20" 
+                  "flex items-center gap-2 px-4 py-2 text-[12px] font-mono font-bold uppercase tracking-widest rounded-lg transition-all border",
+                  hasApiKey
+                    ? "bg-teal-800 border-teal-900/10 text-current opacity-80 hover:border-teal-900/20"
                     : "bg-red-900/20 border-red-500 text-red-500 animate-pulse"
                 )}
               >
@@ -1206,12 +1457,78 @@ export default function App() {
             </div>
           )}
           <div className="hidden md:flex flex-col items-end mr-4">
-            <span className="text-[10px] font-mono uppercase tracking-widest opacity-40">Scribe</span>
-            <span className="text-xs font-mono font-bold text-amber-600/60">KALINDU_M</span>
+            <span className="text-[12px] font-mono uppercase tracking-widest opacity-70">Scribe</span>
+            <span className="text-xs font-mono font-bold text-current opacity-80">KALINDU_M</span>
           </div>
-          <button 
+
+          {/* User API Key Button */}
+          <div className="relative">
+            <button
+              onClick={() => { setShowApiKeyInput(v => !v); setApiKeyInput(''); }}
+              className={cn(
+                "flex items-center gap-2 px-3 py-2 text-[11px] font-mono font-bold uppercase tracking-widest rounded-lg transition-all border",
+                userApiKey
+                  ? "bg-green-900/30 border-green-500/50 text-green-400"
+                  : "bg-teal-800 border-teal-700/40 text-current opacity-70 hover:opacity-100"
+              )}
+              title={userApiKey ? "API Key saved — click to change" : "Set your Gemini API Key"}
+            >
+              <Sparkles className="w-3 h-3" />
+              {userApiKey ? 'Key Active' : 'API Key'}
+              {userApiKey && <span className="w-1.5 h-1.5 bg-green-400 rounded-full" />}
+            </button>
+
+            {/* Collapsible Key Input Panel */}
+            <AnimatePresence>
+              {showApiKeyInput && (
+                <motion.div
+                  initial={{ opacity: 0, scale: 0.95, y: -6 }}
+                  animate={{ opacity: 1, scale: 1, y: 0 }}
+                  exit={{ opacity: 0, scale: 0.95, y: -6 }}
+                  className="absolute right-0 top-full mt-2 z-50 w-80 p-4 rounded-xl border border-spiritual-border/60 bg-teal-900 shadow-2xl"
+                >
+                  <p className="text-[11px] font-mono uppercase tracking-widest opacity-60 mb-3">Gemini API Key</p>
+                  {userApiKey && (
+                    <div className="flex items-center gap-2 mb-3 px-3 py-2 rounded-lg bg-green-900/30 border border-green-500/30">
+                      <span className="w-1.5 h-1.5 bg-green-400 rounded-full flex-shrink-0" />
+                      <span className="text-[11px] font-mono text-green-400 truncate flex-1">
+                        {userApiKey.slice(0, 8)}{'•'.repeat(12)}{userApiKey.slice(-4)}
+                      </span>
+                      <button
+                        onClick={handleClearUserApiKey}
+                        className="text-[10px] font-mono text-red-400 hover:text-red-300 uppercase tracking-widest flex-shrink-0"
+                      >
+                        Clear
+                      </button>
+                    </div>
+                  )}
+                  <div className="flex gap-2">
+                    <input
+                      type="password"
+                      value={apiKeyInput}
+                      onChange={e => setApiKeyInput(e.target.value)}
+                      onKeyDown={e => e.key === 'Enter' && handleSaveUserApiKey()}
+                      placeholder={userApiKey ? 'Enter new key to replace...' : 'AIza...'}
+                      className="flex-1 px-3 py-2 bg-teal-800 border border-teal-700/50 rounded-lg font-mono text-xs focus:ring-2 focus:ring-spiritual-accent outline-none placeholder:opacity-30"
+                      autoFocus
+                    />
+                    <button
+                      onClick={handleSaveUserApiKey}
+                      disabled={!apiKeyInput.trim()}
+                      className="px-3 py-2 bg-spiritual-accent text-black text-[11px] font-mono font-bold uppercase tracking-widest rounded-lg disabled:opacity-40 hover:brightness-110 transition-all"
+                    >
+                      Save
+                    </button>
+                  </div>
+                  <p className="text-[10px] font-mono opacity-40 mt-2">Stored locally in your browser. Never sent to any server.</p>
+                </motion.div>
+              )}
+            </AnimatePresence>
+          </div>
+
+          <button
             onClick={() => setIsDarkMode(!isDarkMode)}
-            className="p-3 spiritual-card hover:bg-amber-800/20 transition-all group"
+            className="p-3 spiritual-card hover:bg-teal-700 transition-all group"
           >
             {isDarkMode ? <Sun className="w-5 h-5 text-spiritual-accent" /> : <Moon className="w-5 h-5 text-spiritual-accent" />}
           </button>
@@ -1219,30 +1536,30 @@ export default function App() {
       </header>
 
       <main className="max-w-7xl mx-auto px-6 py-12 space-y-12">
-        
+
         {/* Input Section */}
         <section className="spiritual-card relative">
           <div className="p-8">
             <div className="flex gap-6 mb-8 border-b border-spiritual-border pb-6">
-              <button 
+              <button
                 onClick={() => setActiveTab('upload')}
                 className={cn(
                   "px-6 py-3 rounded-xl font-display font-bold uppercase tracking-wider transition-all flex items-center gap-3",
-                  activeTab === 'upload' 
-                    ? "bg-spiritual-accent text-black shadow-lg" 
-                    : "text-amber-600/60 hover:text-amber-600 hover:bg-amber-900/10"
+                  activeTab === 'upload'
+                    ? "bg-spiritual-accent text-black shadow-lg"
+                    : "text-current opacity-80 hover:text-teal-600 hover:bg-teal-800"
                 )}
               >
                 <Upload className="w-5 h-5" />
                 Direct Upload
               </button>
-              <button 
+              <button
                 onClick={() => setActiveTab('drive')}
                 className={cn(
                   "px-6 py-3 rounded-xl font-display font-bold uppercase tracking-wider transition-all flex items-center gap-3",
-                  activeTab === 'drive' 
-                    ? "bg-spiritual-accent text-black shadow-lg" 
-                    : "text-amber-600/60 hover:text-amber-600 hover:bg-amber-900/10"
+                  activeTab === 'drive'
+                    ? "bg-spiritual-accent text-black shadow-lg"
+                    : "text-current opacity-80 hover:text-teal-600 hover:bg-teal-800"
                 )}
               >
                 <LinkIcon className="w-5 h-5" />
@@ -1258,33 +1575,21 @@ export default function App() {
                   animate={{ opacity: 1, y: 0 }}
                   exit={{ opacity: 0, y: -10 }}
                   {...getRootProps()}
-                  className={cn(
-                    "border-2 border-dashed rounded-3xl p-16 flex flex-col items-center justify-center cursor-pointer transition-all relative overflow-hidden group",
-                    isDragActive ? "border-spiritual-accent bg-spiritual-accent/5" : "border-amber-900/20 hover:border-spiritual-accent/50 hover:bg-amber-900/5",
-                    audioFile && "border-spiritual-accent bg-spiritual-accent/5"
-                  )}
+                  className="w-full flex flex-col items-center"
                 >
                   <input {...getInputProps()} />
-                  <div className="w-20 h-20 bg-amber-900/10 rounded-full flex items-center justify-center mb-6 group-hover:scale-110 transition-transform">
-                    <Upload className={cn("w-10 h-10 transition-colors", audioFile ? "text-spiritual-accent" : "text-amber-900/40 group-hover:text-spiritual-accent")} />
-                  </div>
-                  {audioFile ? (
-                    <div className="text-center">
-                      <p className="font-display font-bold text-2xl text-amber-900 dark:text-amber-100 mb-1">{audioFile.name}</p>
-                      <p className="font-mono text-xs opacity-40 uppercase tracking-widest">{(audioFile.size / (1024 * 1024)).toFixed(2)} MB // READY</p>
-                      <button 
+                  <button className="w-full flex items-center justify-center gap-4 py-4 rounded-xl font-display font-bold text-xl uppercase tracking-widest transition-all bg-teal-800 text-teal-100 hover:bg-teal-700 shadow-lg cursor-pointer">
+                    <Upload className="w-6 h-6" />
+                    {audioFile ? audioFile.name : "Upload Audio File"}
+                  </button>
+                  {audioFile && (
+                    <div className="mt-4">
+                      <button
                         onClick={(e) => { e.stopPropagation(); clearAudio(); }}
-                        className="mt-4 px-4 py-2 bg-red-900/10 text-red-600 rounded-lg text-xs font-mono font-bold uppercase tracking-widest hover:bg-red-600 hover:text-white transition-all"
+                        className="px-6 py-2 bg-red-600 text-white rounded-lg text-xs font-mono font-bold uppercase tracking-widest hover:bg-red-500 transition-all shadow-md"
                       >
                         Clear Audio
                       </button>
-                    </div>
-                  ) : (
-                    <div className="text-center space-y-2">
-                      <p className="font-display font-bold text-3xl tracking-tight text-amber-900 dark:text-amber-100">OFFER DHARMA AUDIO</p>
-                      <p className="text-sm font-mono opacity-40 uppercase tracking-widest">Drag & Drop or Click to Select Source</p>
-                      <p className="text-[10px] font-mono text-spiritual-accent/60 mt-4">Supports MP3, WAV, M4A // Tap to Browse Files</p>
-                      <p className="text-[9px] font-mono text-amber-600/30 mt-2 italic">විශාල ගොනු සඳහා 'Trim' භාවිතා කර කොටස් වශයෙන් පරිවර්තනය කිරීම වඩාත් නිවැරදි වේ.</p>
                     </div>
                   )}
                 </motion.div>
@@ -1298,87 +1603,116 @@ export default function App() {
                 >
                   <div className="flex items-center gap-2 mb-2">
                     <span className="w-1 h-4 bg-spiritual-accent rounded-full" />
-                    <label className="text-xs font-mono font-bold uppercase tracking-widest text-amber-600/60">Cloud Source Identifier</label>
+                    <label className="text-xs font-mono font-bold uppercase tracking-widest text-current opacity-80">Cloud Source Identifier</label>
                   </div>
                   <div className="flex gap-4">
                     <div className="relative flex-1">
-                      <input 
-                        type="text" 
+                      <input
+                        type="text"
                         value={driveLink}
                         onChange={(e) => setDriveLink(e.target.value)}
+                        onKeyDown={(e) => e.key === 'Enter' && handleFetchDriveAudio()}
                         placeholder="https://drive.google.com/file/d/..."
-                        className="w-full px-6 py-4 bg-amber-900/5 border border-amber-900/10 rounded-2xl font-mono text-sm focus:ring-2 focus:ring-spiritual-accent outline-none transition-all placeholder:opacity-20"
+                        className="w-full px-6 py-4 bg-teal-800 border border-teal-900/10 rounded-2xl font-mono text-sm focus:ring-2 focus:ring-spiritual-accent outline-none transition-all placeholder:opacity-20"
                       />
                       <div className="absolute right-4 top-1/2 -translate-y-1/2 opacity-20">
                         <Cloud className="w-5 h-5" />
                       </div>
                     </div>
-                    <button className="px-8 py-4 bg-amber-900/10 hover:bg-amber-900/20 text-amber-600 rounded-2xl font-display font-bold uppercase tracking-widest transition-all">
-                      Fetch
+                    <button
+                      onClick={handleFetchDriveAudio}
+                      disabled={isFetchingDrive || !driveLink.trim()}
+                      className={cn(
+                        "px-8 py-4 rounded-2xl font-display font-bold uppercase tracking-widest transition-all flex items-center gap-2",
+                        isFetchingDrive
+                          ? "bg-teal-700 text-teal-400 cursor-not-allowed"
+                          : "bg-spiritual-accent text-black hover:brightness-110 shadow-lg"
+                      )}
+                    >
+                      {isFetchingDrive ? (
+                        <><div className="w-4 h-4 border-2 border-teal-400/30 border-t-teal-300 rounded-full animate-spin" />Fetching...</>
+                      ) : (
+                        <><Cloud className="w-4 h-4" />Fetch</>
+                      )}
                     </button>
                   </div>
+                  <p className="text-[11px] font-mono opacity-40 mt-2 text-center">
+                    ⓘ Google Drive ගොනුව &quot;Anyone with the link&quot; ලෙස Share කර ඇති බවට සහතික වන්න
+                  </p>
                 </motion.div>
               )}
             </AnimatePresence>
 
             {/* Pre-transcription Audio Controls */}
             {audioFile && (
-              <motion.div 
+              <motion.div
                 initial={{ opacity: 0, height: 0 }}
                 animate={{ opacity: 1, height: 'auto' }}
                 className="mt-8 pt-8 border-t border-spiritual-border"
               >
                 <div className="flex flex-col md:flex-row items-center gap-8">
                   <div className="flex items-center gap-4">
-                    <button 
+                    <button
                       onClick={togglePlay}
                       className="w-14 h-14 bg-spiritual-accent text-black rounded-full flex items-center justify-center hover:scale-110 active:scale-95 transition-all shadow-lg"
                     >
                       {isPlaying ? <Pause className="w-6 h-6" /> : <Play className="w-6 h-6 ml-1" />}
                     </button>
                     <div className="space-y-1">
-                      <p className="text-[10px] font-mono uppercase tracking-widest opacity-40">Preview Audio</p>
+                      <p className="text-[12px] font-mono uppercase tracking-widest opacity-70">Preview Audio</p>
                       <p className="text-xl font-mono font-bold text-spiritual-accent">{formatTime(currentTime)} / {formatTime(duration)}</p>
                     </div>
                   </div>
 
                   <div className="flex-1 w-full">
                     <div className="flex justify-between items-center mb-2">
-                      <span className="text-[10px] font-mono uppercase tracking-widest opacity-40">Signal Purification & Enhancement</span>
-                      <span className="text-[10px] font-mono uppercase tracking-widest text-spiritual-accent animate-pulse">Inspect Quality Before Scribing</span>
+                      <span className="text-[12px] font-mono uppercase tracking-widest opacity-70">Signal Purification & Enhancement</span>
+                      <span className="text-[12px] font-mono uppercase tracking-widest text-spiritual-accent animate-pulse">Inspect Quality Before Scribing</span>
                     </div>
-                    <div className="flex gap-4">
-                      <button 
+                    <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                      <button
+                        onClick={toggleMusicIsolation}
+                        className={cn(
+                          "py-4 rounded-xl transition-all flex items-center justify-center gap-3 border font-display font-bold uppercase tracking-widest text-[12px]",
+                          isMusicIsolated
+                            ? "bg-spiritual-accent/20 border-spiritual-accent text-spiritual-accent shadow-[0_0_15px_rgba(212,175,55,0.3)]"
+                            : "bg-teal-800 border-teal-900/10 text-current opacity-80 hover:border-teal-600/40"
+                        )}
+                      >
+                        <Music className={cn("w-4 h-4", isMusicIsolated && "animate-pulse")} />
+                        {isMusicIsolated ? "Music Removed" : "Remove Music"}
+                      </button>
+                      <button
                         onClick={toggleVolumeBoost}
                         className={cn(
-                          "flex-1 py-4 rounded-xl transition-all flex items-center justify-center gap-3 border font-display font-bold uppercase tracking-widest text-xs",
-                          isVolumeBoosted 
-                            ? "bg-spiritual-accent/20 border-spiritual-accent text-spiritual-accent shadow-[0_0_15px_rgba(212,175,55,0.3)]" 
-                            : "bg-amber-900/5 border-amber-900/10 text-amber-600/60 hover:border-amber-600/40"
+                          "py-4 rounded-xl transition-all flex items-center justify-center gap-3 border font-display font-bold uppercase tracking-widest text-[12px]",
+                          isVolumeBoosted
+                            ? "bg-spiritual-accent/20 border-spiritual-accent text-spiritual-accent shadow-[0_0_15px_rgba(212,175,55,0.3)]"
+                            : "bg-teal-800 border-teal-900/10 text-current opacity-80 hover:border-teal-600/40"
                         )}
                       >
-                        <Volume2 className={cn("w-5 h-5", isVolumeBoosted && "animate-pulse")} />
-                        {isVolumeBoosted ? "Volume Boosted" : "Boost Volume"}
+                        <Volume2 className={cn("w-4 h-4", isVolumeBoosted && "animate-pulse")} />
+                        {isVolumeBoosted ? "Vocals Boosted" : "Boost Vocals"}
                       </button>
-                      <button 
+                      <button
                         onClick={toggleNoiseReduction}
                         className={cn(
-                          "flex-1 py-4 rounded-xl transition-all flex items-center justify-center gap-3 border font-display font-bold uppercase tracking-widest text-xs",
-                          isNoiseReductionEnabled 
-                            ? "bg-spiritual-accent/20 border-spiritual-accent text-spiritual-accent shadow-[0_0_15px_rgba(212,175,55,0.3)]" 
-                            : "bg-amber-900/5 border-amber-900/10 text-amber-600/60 hover:border-amber-600/40"
+                          "py-4 rounded-xl transition-all flex items-center justify-center gap-3 border font-display font-bold uppercase tracking-widest text-[12px]",
+                          isNoiseReductionEnabled
+                            ? "bg-spiritual-accent/20 border-spiritual-accent text-spiritual-accent shadow-[0_0_15px_rgba(212,175,55,0.3)]"
+                            : "bg-teal-800 border-teal-900/10 text-current opacity-80 hover:border-teal-600/40"
                         )}
                       >
-                        <Sparkles className={cn("w-5 h-5", isNoiseReductionEnabled && "animate-pulse")} />
-                        {isNoiseReductionEnabled ? "Noise Purified" : "Purify Signal"}
+                        <Sparkles className={cn("w-4 h-4", isNoiseReductionEnabled && "animate-pulse")} />
+                        {isNoiseReductionEnabled ? "Noise Purified" : "Remove Noise"}
                       </button>
                     </div>
                   </div>
                 </div>
-                
-                <audio 
-                  ref={audioRef} 
-                  onTimeUpdate={handleTimeUpdate} 
+
+                <audio
+                  ref={audioRef}
+                  onTimeUpdate={handleTimeUpdate}
                   onLoadedMetadata={handleLoadedMetadata}
                   onEnded={() => setIsPlaying(false)}
                   className="hidden"
@@ -1386,53 +1720,118 @@ export default function App() {
               </motion.div>
             )}
 
-            <button 
+            <button
               onClick={handleTranscribe}
               disabled={isTranscribing || !audioFile}
               className={cn(
                 "w-full mt-10 py-5 rounded-2xl font-display font-bold text-2xl uppercase tracking-[0.2em] flex items-center justify-center gap-4 transition-all relative overflow-hidden",
-                isTranscribing 
-                  ? "bg-amber-900/10 text-amber-600/40 cursor-not-allowed" 
+                isTranscribing
+                  ? "bg-teal-800 text-current opacity-60 cursor-not-allowed"
                   : "bg-spiritual-accent text-black hover:scale-[1.01] active:scale-[0.99] shadow-xl"
               )}
             >
               {isTranscribing ? (
                 <>
-                  <div className="w-6 h-6 border-3 border-amber-600/20 border-t-spiritual-accent rounded-full animate-spin" />
+                  <div className="w-6 h-6 border-3 border-teal-600/20 border-t-spiritual-accent rounded-full animate-spin" />
                   Scribing Dharma...
                 </>
               ) : (
                 <>
                   <Sparkles className="w-7 h-7" />
-                  {isNoiseReductionEnabled || isVolumeBoosted ? "Scribe Purified Dharma" : "Begin Transcription"}
+                  {isNoiseReductionEnabled || isVolumeBoosted || isMusicIsolated ? "Scribe Purified Dharma" : "Begin Transcription"}
                 </>
               )}
             </button>
+
+            {/* Transcription Timer */}
+            <AnimatePresence>
+              {(isTranscribing || transcribeElapsedTime > 0) && (
+                <motion.div
+                  initial={{ opacity: 0, y: -8 }}
+                  animate={{ opacity: 1, y: 0 }}
+                  exit={{ opacity: 0, y: -8 }}
+                  className={cn(
+                    "mt-4 flex items-center justify-center gap-6 px-6 py-3 rounded-xl border transition-colors",
+                    transcribeComplete
+                      ? "bg-teal-900/40 border-teal-600/30"
+                      : "bg-teal-800/60 border-spiritual-border/40"
+                  )}
+                >
+                  {/* Status dot + label */}
+                  <div className="flex items-center gap-2">
+                    {transcribeComplete ? (
+                      <CheckCircle2 className="w-4 h-4 text-green-400" />
+                    ) : (
+                      <span className="w-2 h-2 bg-spiritual-accent rounded-full animate-pulse" />
+                    )}
+                    <span className="text-xs font-mono uppercase tracking-widest opacity-60">
+                      {transcribeComplete ? 'Completed In' : 'Elapsed'}
+                    </span>
+                    <span className={cn(
+                      "text-sm font-mono font-bold tabular-nums",
+                      transcribeComplete ? "text-green-400" : "text-spiritual-accent"
+                    )}>
+                      {String(Math.floor(transcribeElapsedTime / 60)).padStart(2, '0')}:{String(transcribeElapsedTime % 60).padStart(2, '0')}
+                    </span>
+                  </div>
+
+                  {estimatedTranscribeTime !== null && (
+                    <>
+                      <span className="opacity-20 text-xs">|</span>
+                      {!transcribeComplete && (
+                        <div className="flex items-center gap-2">
+                          <span className="text-xs font-mono uppercase tracking-widest opacity-60">Est. Total</span>
+                          <span className="text-sm font-mono font-bold opacity-80 tabular-nums">
+                            ~{String(Math.floor(estimatedTranscribeTime / 60)).padStart(2, '0')}:{String(estimatedTranscribeTime % 60).padStart(2, '0')}
+                          </span>
+                        </div>
+                      )}
+                      <div className="flex-1 max-w-[140px] h-1.5 bg-teal-700 rounded-full overflow-hidden">
+                        <div
+                          className={cn(
+                            "h-full rounded-full transition-all duration-1000",
+                            transcribeComplete ? "bg-green-400" : "bg-spiritual-accent"
+                          )}
+                          style={{
+                            width: transcribeComplete
+                              ? '100%'
+                              : `${Math.min(98, (transcribeElapsedTime / estimatedTranscribeTime) * 100)}%`
+                          }}
+                        />
+                      </div>
+                      {transcribeComplete && (
+                        <span className="text-xs font-mono text-green-400 opacity-70 uppercase tracking-widest">100%</span>
+                      )}
+                    </>
+                  )}
+                </motion.div>
+              )}
+            </AnimatePresence>
           </div>
         </section>
 
         {/* Player & Editor Section */}
         {(audioFile || transcript) && (
-          <div className="grid grid-cols-1 lg:grid-cols-12 gap-10">
-            <div className="lg:col-span-8 space-y-10">
+          <div className="flex flex-col gap-10">
+            <div className="w-full space-y-10">
               {/* Active Segment Preview */}
               <AnimatePresence>
                 {isPlaying && activeSegmentIndex !== null && (
-                  <motion.div 
+                  <motion.div
                     initial={{ opacity: 0, y: 20 }}
                     animate={{ opacity: 1, y: 0 }}
                     exit={{ opacity: 0, y: -20 }}
-                    className="spiritual-card p-6 border-l-4 border-spiritual-accent bg-amber-900/5"
+                    className="spiritual-card p-6 border-l-4 border-spiritual-accent bg-teal-800"
                   >
                     <div className="flex items-center gap-2 mb-2">
-                      <span className="text-[10px] font-mono uppercase tracking-widest text-spiritual-accent">Active Dharma Segment</span>
+                      <span className="text-[12px] font-mono uppercase tracking-widest text-spiritual-accent">Active Dharma Segment</span>
                       <div className="flex gap-1">
                         <span className="w-1 h-1 bg-spiritual-accent rounded-full animate-pulse" />
                         <span className="w-1 h-1 bg-spiritual-accent rounded-full animate-pulse delay-75" />
                         <span className="w-1 h-1 bg-spiritual-accent rounded-full animate-pulse delay-150" />
                       </div>
                     </div>
-                    <p className="text-xl font-display font-bold text-amber-900 dark:text-amber-100 leading-relaxed">
+                    <p className="text-xl font-display font-bold text-teal-900 dark:text-teal-100 leading-relaxed">
                       {segments[activeSegmentIndex].text}
                     </p>
                   </motion.div>
@@ -1449,19 +1848,19 @@ export default function App() {
                       </div>
                       <div>
                         <h3 className="text-sm font-mono font-bold uppercase tracking-widest text-spiritual-accent">Playback Monitor</h3>
-                        <p className="text-[10px] text-amber-600/40 font-mono uppercase tracking-tighter">Real-time Spectral Analysis // Drag to Select</p>
+                        <p className="text-[12px] text-current opacity-60 font-mono uppercase tracking-tighter">Real-time Spectral Analysis // Drag to Select</p>
                       </div>
                     </div>
-                    <div className="flex items-center gap-4 text-[10px] font-mono font-bold text-amber-600/60 bg-amber-900/5 px-3 py-1.5 rounded-full border border-amber-900/10">
+                    <div className="flex items-center gap-4 text-[12px] font-mono font-bold text-current opacity-80 bg-teal-800 px-3 py-1.5 rounded-full border border-teal-900/10">
                       <span className="text-spiritual-accent">{formatTime(currentTime)}</span>
                       <span className="opacity-30">/</span>
                       <span>{formatTime(duration)}</span>
                     </div>
                   </div>
 
-                  <div className="relative h-20 bg-amber-900/5 rounded-xl border border-amber-900/10 overflow-hidden group-hover:border-spiritual-accent/20 transition-all">
+                  <div className="relative h-20 bg-teal-800 rounded-xl border border-teal-900/10 overflow-hidden group-hover:border-spiritual-accent/20 transition-all">
                     <div ref={waveformRef} className="w-full h-full" />
-                    
+
                     {/* Grid Overlay */}
                     <div className="absolute inset-0 pointer-events-none opacity-[0.03] overflow-hidden">
                       <div className="w-full h-full" style={{ backgroundImage: 'linear-gradient(#d4af37 1px, transparent 1px), linear-gradient(90deg, #d4af37 1px, transparent 1px)', backgroundSize: '20px 20px' }} />
@@ -1470,42 +1869,42 @@ export default function App() {
 
                   <div className="mt-4 flex items-center justify-between">
                     <div className="flex items-center gap-4">
-                      <button 
+                      <button
                         onClick={togglePlay}
-                        className="w-10 h-10 flex items-center justify-center bg-spiritual-accent text-amber-950 rounded-full shadow-[0_0_15px_rgba(212,175,55,0.4)] hover:scale-105 transition-all active:scale-95"
+                        className="w-10 h-10 flex items-center justify-center bg-spiritual-accent text-teal-950 rounded-full shadow-[0_0_15px_rgba(212,175,55,0.4)] hover:scale-105 transition-all active:scale-95"
                       >
                         {isPlaying ? <Pause className="w-5 h-5 fill-current" /> : <Play className="w-5 h-5 fill-current ml-0.5" />}
                       </button>
                       <div className="flex flex-col">
-                        <span className="text-[10px] font-mono font-bold uppercase tracking-widest text-amber-600/60">Status</span>
-                        <span className={cn("text-xs font-mono font-bold uppercase tracking-widest", isPlaying ? "text-spiritual-accent" : "text-amber-600/40")}>
+                        <span className="text-[12px] font-mono font-bold uppercase tracking-widest text-current opacity-80">Status</span>
+                        <span className={cn("text-xs font-mono font-bold uppercase tracking-widest", isPlaying ? "text-spiritual-accent" : "text-current opacity-60")}>
                           {isPlaying ? "Active Stream" : "Standby"}
                         </span>
                       </div>
                     </div>
-                    
+
                     <div className="flex items-center gap-2">
-                      <div className="flex items-center gap-3 bg-amber-900/5 p-1.5 rounded-lg border border-amber-900/10 mr-2">
-                        <span className="text-[10px] font-mono font-bold uppercase tracking-widest text-amber-600/40 ml-1">Zoom</span>
+                      <div className="flex items-center gap-3 bg-teal-800 p-1.5 rounded-lg border border-teal-900/10 mr-2">
+                        <span className="text-[12px] font-mono font-bold uppercase tracking-widest text-current opacity-60 ml-1">Zoom</span>
                         <div className="flex items-center gap-1">
-                          <button 
+                          <button
                             onClick={() => setZoom(prev => Math.max(0, prev - 10))}
-                            className="p-1 hover:bg-amber-900/10 rounded transition-all text-amber-600/60 hover:text-amber-600"
+                            className="p-1 hover:bg-teal-800 rounded transition-all text-current opacity-80 hover:text-teal-600"
                             title="Zoom Out"
                           >
                             <ZoomOut className="w-3.5 h-3.5" />
                           </button>
-                          <input 
-                            type="range" 
-                            min="0" 
-                            max="200" 
-                            value={zoom} 
+                          <input
+                            type="range"
+                            min="0"
+                            max="200"
+                            value={zoom}
                             onChange={(e) => setZoom(Number(e.target.value))}
                             className="w-16 accent-spiritual-accent h-1.5"
                           />
-                          <button 
+                          <button
                             onClick={() => setZoom(prev => Math.min(200, prev + 10))}
-                            className="p-1 hover:bg-amber-900/10 rounded transition-all text-amber-600/60 hover:text-amber-600"
+                            className="p-1 hover:bg-teal-800 rounded transition-all text-current opacity-80 hover:text-teal-600"
                             title="Zoom In"
                           >
                             <ZoomIn className="w-3.5 h-3.5" />
@@ -1515,13 +1914,13 @@ export default function App() {
 
                       <AnimatePresence>
                         {selectedRegion && (
-                          <motion.div 
+                          <motion.div
                             initial={{ opacity: 0, x: 20 }}
                             animate={{ opacity: 1, x: 0 }}
                             exit={{ opacity: 0, x: 20 }}
                             className="flex items-center gap-2 bg-spiritual-accent/10 p-1 rounded-xl border border-spiritual-accent/20 mr-2"
                           >
-                            <button 
+                            <button
                               onClick={handleRefine}
                               disabled={isRefining}
                               className="p-2 hover:bg-spiritual-accent/20 rounded-lg transition-all text-spiritual-accent flex items-center gap-2 group"
@@ -1532,36 +1931,43 @@ export default function App() {
                               ) : (
                                 <Wand2 className="w-4 h-4 group-hover:scale-110 transition-transform" />
                               )}
-                              <span className="text-[10px] font-mono font-bold uppercase tracking-widest hidden md:inline">Refine</span>
+                              <span className="text-[12px] font-mono font-bold uppercase tracking-widest hidden md:inline">Refine</span>
                             </button>
                             <div className="w-px h-4 bg-spiritual-accent/20" />
-                            <button 
+                            <button
                               onClick={handleTrim}
                               disabled={isTrimming}
                               className="p-2 hover:bg-red-900/20 rounded-lg transition-all text-red-600 flex items-center gap-2 group"
-                              title="Trim Selection"
+                              title="Cut Selection"
                             >
                               {isTrimming ? (
                                 <div className="w-4 h-4 border-2 border-red-600 border-t-transparent rounded-full animate-spin" />
                               ) : (
                                 <Scissors className="w-4 h-4 group-hover:scale-110 transition-transform" />
                               )}
-                              <span className="text-[10px] font-mono font-bold uppercase tracking-widest hidden md:inline">Trim</span>
+                              <span className="text-[12px] font-mono font-bold uppercase tracking-widest hidden md:inline">Cut</span>
                             </button>
                           </motion.div>
                         )}
                       </AnimatePresence>
 
-                      <button 
-                        onClick={() => { if(wavesurferRef.current) wavesurferRef.current.setTime(0); }}
-                        className="p-2 bg-amber-900/5 border border-amber-900/10 rounded-lg transition-all text-amber-600/60 hover:text-amber-600"
+                      <button
+                        onClick={handleDownloadAudio}
+                        className="p-2 bg-teal-800 border border-teal-900/10 rounded-lg transition-all text-current opacity-80 hover:text-spiritual-accent mr-1"
+                        title="Download Audio"
+                      >
+                        <Download className="w-4 h-4" />
+                      </button>
+                      <button
+                        onClick={() => { if (wavesurferRef.current) wavesurferRef.current.setTime(0); }}
+                        className="p-2 bg-teal-800 border border-teal-900/10 rounded-lg transition-all text-current opacity-80 hover:text-teal-600"
                         title="Reset Playback"
                       >
                         <RotateCcw className="w-4 h-4" />
                       </button>
-                      <div className="w-px h-8 bg-amber-900/10 mx-2" />
+                      <div className="w-px h-8 bg-teal-800 mx-2" />
                       <div className="flex flex-col items-end">
-                        <span className="text-[10px] font-mono font-bold uppercase tracking-widest text-amber-600/60">Bitrate</span>
+                        <span className="text-[12px] font-mono font-bold uppercase tracking-widest text-current opacity-80">Bitrate</span>
                         <span className="text-xs font-mono font-bold text-spiritual-accent">320 KBPS</span>
                       </div>
                     </div>
@@ -1570,8 +1976,8 @@ export default function App() {
               )}
 
               {/* Audio Player (Hidden for processing) */}
-              <audio 
-                ref={audioRef} 
+              <audio
+                ref={audioRef}
                 onTimeUpdate={handleTimeUpdate}
                 onLoadedMetadata={handleLoadedMetadata}
                 onEnded={() => setIsPlaying(false)}
@@ -1581,45 +1987,45 @@ export default function App() {
               {/* Editor */}
               <div className="spiritual-card flex flex-col">
                 {/* Toolbar */}
-                <div className="px-6 py-4 border-b border-spiritual-border flex flex-wrap items-center gap-4 bg-amber-900/5">
+                <div className="px-6 py-4 border-b border-spiritual-border flex flex-wrap items-center gap-4 bg-teal-800">
                   <div className="flex items-center gap-1 pr-4 border-r border-spiritual-border">
-                    <button onClick={() => execCommand('bold')} className="p-2 hover:bg-amber-900/10 rounded-lg transition-all text-amber-600/60 hover:text-spiritual-accent"><Bold className="w-5 h-5" /></button>
-                    <button onClick={() => execCommand('italic')} className="p-2 hover:bg-amber-900/10 rounded-lg transition-all text-amber-600/60 hover:text-spiritual-accent"><Italic className="w-5 h-5" /></button>
-                    <button onClick={() => execCommand('underline')} className="p-2 hover:bg-amber-900/10 rounded-lg transition-all text-amber-600/60 hover:text-spiritual-accent"><Underline className="w-5 h-5" /></button>
+                    <button onClick={() => execCommand('bold')} className="p-2 hover:bg-teal-800 rounded-lg transition-all text-current opacity-80 hover:text-spiritual-accent"><Bold className="w-5 h-5" /></button>
+                    <button onClick={() => execCommand('italic')} className="p-2 hover:bg-teal-800 rounded-lg transition-all text-current opacity-80 hover:text-spiritual-accent"><Italic className="w-5 h-5" /></button>
+                    <button onClick={() => execCommand('underline')} className="p-2 hover:bg-teal-800 rounded-lg transition-all text-current opacity-80 hover:text-spiritual-accent"><Underline className="w-5 h-5" /></button>
                   </div>
                   <div className="flex items-center gap-1 pr-4 border-r border-spiritual-border">
-                    <button onClick={() => execCommand('undo')} className="p-2 hover:bg-amber-900/10 rounded-lg transition-all text-amber-600/60 hover:text-spiritual-accent"><Undo className="w-5 h-5" /></button>
-                    <button onClick={() => execCommand('redo')} className="p-2 hover:bg-amber-900/10 rounded-lg transition-all text-amber-600/60 hover:text-spiritual-accent"><Redo className="w-5 h-5" /></button>
+                    <button onClick={() => execCommand('undo')} className="p-2 hover:bg-teal-800 rounded-lg transition-all text-current opacity-80 hover:text-spiritual-accent"><Undo className="w-5 h-5" /></button>
+                    <button onClick={() => execCommand('redo')} className="p-2 hover:bg-teal-800 rounded-lg transition-all text-current opacity-80 hover:text-spiritual-accent"><Redo className="w-5 h-5" /></button>
                   </div>
-                  <button 
+                  <button
                     onClick={toggleListening}
                     className={cn(
                       "px-4 py-2 rounded-lg transition-all flex items-center gap-3 border",
-                      isListening 
-                        ? "bg-red-900/20 border-red-500 text-red-500 animate-pulse" 
-                        : "bg-amber-900/5 border-amber-900/10 text-amber-600/60 hover:border-amber-900/20"
+                      isListening
+                        ? "bg-red-900/20 border-red-500 text-red-500 animate-pulse"
+                        : "bg-teal-800 border-teal-900/10 text-current opacity-80 hover:border-teal-900/20"
                     )}
                     title="Voice Typing (Sinhala)"
                   >
                     <div className={cn("w-2 h-2 rounded-full", isListening ? "bg-red-500 animate-ping" : "bg-red-500")} />
                     <span className="text-xs font-mono font-bold uppercase tracking-widest">{isListening ? "Listening..." : "Voice Input"}</span>
                   </button>
-                  <button 
+                  <button
                     onClick={handleShare}
                     disabled={isSharing || !transcript}
                     className={cn(
                       "px-4 py-2 rounded-lg transition-all flex items-center gap-3 border",
-                      isSharing 
-                        ? "bg-spiritual-accent/20 border-spiritual-accent text-spiritual-accent" 
-                        : "bg-amber-900/5 border-amber-900/10 text-amber-600/60 hover:border-amber-900/20"
+                      isSharing
+                        ? "bg-spiritual-accent/20 border-spiritual-accent text-spiritual-accent"
+                        : "bg-teal-800 border-teal-900/10 text-current opacity-80 hover:border-teal-900/20"
                     )}
                     title="Create Public Share Link"
                   >
                     <LinkIcon className={cn("w-4 h-4", isSharing && "animate-spin")} />
                     <span className="text-xs font-mono font-bold uppercase tracking-widest">{isSharing ? "Sharing..." : "Share Link"}</span>
                   </button>
-                  <button 
-                    onClick={() => { if(editorRef.current) editorRef.current.innerHTML = ''; setTranscript(''); }}
+                  <button
+                    onClick={() => { if (editorRef.current) editorRef.current.innerHTML = ''; setTranscript(''); }}
                     className="ml-auto flex items-center gap-2 px-4 py-2 text-xs font-mono font-bold uppercase tracking-widest text-red-500/60 hover:text-red-500 hover:bg-red-500/10 rounded-lg transition-all"
                   >
                     <Trash2 className="w-4 h-4" />
@@ -1629,23 +2035,23 @@ export default function App() {
 
                 {/* Legend */}
                 {segments.some(s => s.type && s.type !== 'normal') && (
-                  <div className="px-6 py-2 border-b border-spiritual-border flex flex-wrap items-center gap-4 bg-amber-900/5">
-                    <span className="text-[10px] font-mono font-bold uppercase tracking-widest text-amber-600/40">Detected:</span>
+                  <div className="px-6 py-2 border-b border-spiritual-border flex flex-wrap items-center gap-4 bg-teal-800">
+                    <span className="text-[12px] font-mono font-bold uppercase tracking-widest text-current opacity-60">Detected:</span>
                     <div className="flex items-center gap-2">
                       <div className="w-2 h-2 rounded-full bg-blue-400" />
-                      <span className="text-[10px] font-mono font-bold uppercase tracking-widest text-blue-600/60">Names</span>
+                      <span className="text-[12px] font-mono font-bold uppercase tracking-widest text-blue-600/60">Names</span>
                     </div>
                     <div className="flex items-center gap-2">
                       <div className="w-2 h-2 rounded-full bg-green-400" />
-                      <span className="text-[10px] font-mono font-bold uppercase tracking-widest text-green-600/60">Slang</span>
+                      <span className="text-[12px] font-mono font-bold uppercase tracking-widest text-green-600/60">Slang</span>
                     </div>
                     <div className="flex items-center gap-2">
                       <div className="w-2 h-2 rounded-full bg-red-400" />
-                      <span className="text-[10px] font-mono font-bold uppercase tracking-widest text-red-600/60">Inappropriate</span>
+                      <span className="text-[12px] font-mono font-bold uppercase tracking-widest text-red-600/60">Inappropriate</span>
                     </div>
                     <div className="flex items-center gap-2">
                       <div className="w-2 h-2 rounded-full bg-gray-400" />
-                      <span className="text-[10px] font-mono font-bold uppercase tracking-widest text-gray-600/60">Silences</span>
+                      <span className="text-[12px] font-mono font-bold uppercase tracking-widest text-gray-600/60">Silences</span>
                     </div>
                   </div>
                 )}
@@ -1655,14 +2061,14 @@ export default function App() {
                     <div className="flex items-center gap-3">
                       <CheckCircle2 className="w-4 h-4 text-spiritual-accent" />
                       <span className="text-xs font-mono font-bold text-spiritual-accent uppercase tracking-widest">Public Link Ready:</span>
-                      <code className="text-[10px] bg-black/20 px-2 py-1 rounded text-amber-100/60">{shareUrl}</code>
+                      <code className="text-[12px] bg-black/20 px-2 py-1 rounded text-teal-100/60">{shareUrl}</code>
                     </div>
-                    <button 
+                    <button
                       onClick={() => {
                         navigator.clipboard.writeText(shareUrl);
                         alert('සබැඳිය පිටපත් කරන ලදී!');
                       }}
-                      className="text-[10px] font-mono font-bold uppercase tracking-widest text-spiritual-accent hover:underline"
+                      className="text-[12px] font-mono font-bold uppercase tracking-widest text-spiritual-accent hover:underline"
                     >
                       Copy Link
                     </button>
@@ -1670,11 +2076,11 @@ export default function App() {
                 )}
 
                 {/* Content Area */}
-                <div 
+                <div
                   ref={editorRef}
                   contentEditable={!isPlaying}
                   suppressContentEditableWarning
-                  className="p-10 min-h-[500px] outline-none prose prose-invert max-w-none text-xl leading-relaxed font-display selection:bg-spiritual-accent/30"
+                  className="p-10 h-[calc(100vh-250px)] overflow-y-auto outline-none prose prose-invert max-w-none text-xl leading-relaxed font-display selection:bg-spiritual-accent/30"
                   onInput={(e) => {
                     const newText = e.currentTarget.innerText;
                     setTranscript(newText);
@@ -1690,7 +2096,7 @@ export default function App() {
 
               {/* Briefing Window */}
               {(briefing || isGeneratingBriefing) && (
-                <motion.div 
+                <motion.div
                   initial={{ opacity: 0, y: 30 }}
                   animate={{ opacity: 1, y: 0 }}
                   className="spiritual-card p-10 space-y-6 relative"
@@ -1705,94 +2111,96 @@ export default function App() {
                       </div>
                       <div>
                         <h2 className="text-2xl font-display font-bold tracking-tight">Dharma Essence</h2>
-                        <p className="text-[10px] font-mono uppercase tracking-widest text-spiritual-accent/60">AI Generated Summary</p>
+                        <p className="text-[12px] font-mono uppercase tracking-widest text-spiritual-accent/60">AI Generated Summary</p>
                       </div>
                     </div>
                     {isGeneratingBriefing && (
                       <div className="flex items-center gap-3 px-4 py-2 bg-spiritual-accent/10 rounded-full border border-spiritual-accent/20">
                         <div className="w-3 h-3 border-2 border-spiritual-accent border-t-transparent rounded-full animate-spin" />
-                        <span className="text-[10px] font-mono font-bold uppercase tracking-widest text-spiritual-accent">Contemplating...</span>
+                        <span className="text-[12px] font-mono font-bold uppercase tracking-widest text-spiritual-accent">Contemplating...</span>
                       </div>
                     )}
                   </div>
-                  <div className="prose prose-invert max-w-none text-lg leading-relaxed text-amber-100/60 font-display italic">
+                  <div className="prose prose-invert max-w-none text-lg leading-relaxed text-teal-100/60 font-display italic">
                     {briefing}
                   </div>
                 </motion.div>
               )}
             </div>
 
-            {/* Actions Sidebar */}
-            <aside className="lg:col-span-4 space-y-8">
-              <div className="spiritual-card p-8 space-y-8">
+            {/* Actions Bottom Bar */}
+            <aside className="w-full grid grid-cols-1 lg:grid-cols-3 gap-8">
+              <div className="spiritual-card p-8 lg:col-span-2 space-y-8">
                 <div className="space-y-4">
                   <div className="flex items-center gap-2 mb-2">
                     <span className="w-1 h-4 bg-spiritual-accent rounded-full" />
-                    <h3 className="text-xs font-mono font-bold uppercase tracking-widest text-amber-600/60">Scribe Operations</h3>
+                    <h3 className="text-xs font-mono font-bold uppercase tracking-widest text-current opacity-80">Scribe Operations</h3>
                   </div>
-                  <button 
+                  <button
                     onClick={handleCopy}
-                    className="w-full flex items-center justify-between px-6 py-4 bg-amber-900/10 hover:bg-spiritual-accent hover:text-black rounded-xl transition-all group border border-amber-900/20 hover:border-spiritual-accent"
+                    className="w-full flex items-center justify-between px-6 py-4 bg-teal-800 hover:bg-spiritual-accent hover:text-black rounded-xl transition-all group border border-teal-900/20 hover:border-spiritual-accent"
                   >
                     <div className="flex items-center gap-4">
-                      <Copy className="w-5 h-5 opacity-40 group-hover:opacity-100" />
+                      <Copy className="w-5 h-5 opacity-70 group-hover:opacity-100" />
                       <span className="font-display font-bold uppercase tracking-widest text-sm">Copy to Clipboard</span>
                     </div>
                     <ExternalLink className="w-4 h-4 opacity-20 group-hover:opacity-100" />
                   </button>
                 </div>
 
-                <div className="space-y-4 pt-8 border-t border-spiritual-border">
-                  <div className="flex items-center gap-2 mb-2">
+                <div className="pt-8 border-t border-spiritual-border">
+                  <div className="flex items-center gap-2 mb-6">
                     <span className="w-1 h-4 bg-spiritual-secondary rounded-full" />
-                    <h3 className="text-xs font-mono font-bold uppercase tracking-widest text-amber-600/60">Preserve Dharma</h3>
+                    <h3 className="text-xs font-mono font-bold uppercase tracking-widest text-current opacity-80">Preserve Dharma</h3>
                   </div>
-                  
-                  <button 
-                    onClick={() => handleExportGoogleDocs()}
-                    disabled={isExporting}
-                    className="w-full flex items-center justify-between px-6 py-4 bg-spiritual-secondary/10 text-spiritual-accent hover:bg-spiritual-accent hover:text-black rounded-xl transition-all group border border-spiritual-secondary/20 disabled:opacity-50"
-                  >
-                    <div className="flex items-center gap-4">
-                      {isExporting ? <div className="w-5 h-5 border-2 border-spiritual-accent border-t-transparent rounded-full animate-spin" /> : <Cloud className="w-5 h-5" />}
-                      <span className="font-display font-bold uppercase tracking-widest text-sm text-amber-100 group-hover:text-black">Google Docs</span>
-                    </div>
-                    <Download className="w-4 h-4 opacity-20 group-hover:opacity-100" />
-                  </button>
 
-                  <button 
-                    onClick={handleShare}
-                    disabled={isSharing || !transcript}
-                    className="w-full flex items-center justify-between px-6 py-4 bg-amber-900/10 hover:bg-amber-900/20 rounded-xl transition-all group border border-amber-900/20"
-                  >
-                    <div className="flex items-center gap-4">
-                      <LinkIcon className={cn("w-5 h-5 text-spiritual-accent", isSharing && "animate-spin")} />
-                      <span className="font-display font-bold uppercase tracking-widest text-sm">Public Link (Share)</span>
-                    </div>
-                    <ExternalLink className="w-4 h-4 opacity-20 group-hover:opacity-100" />
-                  </button>
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                    <button
+                      onClick={() => handleExportGoogleDocs()}
+                      disabled={isExporting}
+                      className="w-full flex items-center justify-between px-6 py-4 bg-spiritual-secondary/10 text-spiritual-accent hover:bg-spiritual-accent hover:text-black rounded-xl transition-all group border border-spiritual-secondary/20 disabled:opacity-50"
+                    >
+                      <div className="flex items-center gap-4">
+                        {isExporting ? <div className="w-5 h-5 border-2 border-spiritual-accent border-t-transparent rounded-full animate-spin" /> : <Cloud className="w-5 h-5" />}
+                        <span className="font-display font-bold uppercase tracking-widest text-sm text-teal-100 group-hover:text-black">Google Docs</span>
+                      </div>
+                      <Download className="w-4 h-4 opacity-20 group-hover:opacity-100" />
+                    </button>
 
-                  <button 
-                    onClick={handleExportTxt}
-                    className="w-full flex items-center justify-between px-6 py-4 bg-amber-900/10 hover:bg-amber-900/20 rounded-xl transition-all group border border-amber-900/20"
-                  >
-                    <div className="flex items-center gap-4">
-                      <FileText className="w-5 h-5 opacity-40" />
-                      <span className="font-display font-bold uppercase tracking-widest text-sm">Text File (.txt)</span>
-                    </div>
-                    <Download className="w-4 h-4 opacity-20" />
-                  </button>
+                    <button
+                      onClick={handleShare}
+                      disabled={isSharing || !transcript}
+                      className="w-full flex items-center justify-between px-6 py-4 bg-teal-800 hover:bg-teal-800 rounded-xl transition-all group border border-teal-900/20"
+                    >
+                      <div className="flex items-center gap-4">
+                        <LinkIcon className={cn("w-5 h-5 text-spiritual-accent", isSharing && "animate-spin")} />
+                        <span className="font-display font-bold uppercase tracking-widest text-sm">Public Link (Share)</span>
+                      </div>
+                      <ExternalLink className="w-4 h-4 opacity-20 group-hover:opacity-100" />
+                    </button>
 
-                  <button 
-                    onClick={handleExportDocx}
-                    className="w-full flex items-center justify-between px-6 py-4 bg-amber-900/10 hover:bg-amber-900/20 rounded-xl transition-all group border border-amber-900/20"
-                  >
-                    <div className="flex items-center gap-4">
-                      <FileCode className="w-5 h-5 opacity-40" />
-                      <span className="font-display font-bold uppercase tracking-widest text-sm">Word Doc (.docx)</span>
-                    </div>
-                    <Download className="w-4 h-4 opacity-20" />
-                  </button>
+                    <button
+                      onClick={handleExportTxt}
+                      className="w-full flex items-center justify-between px-6 py-4 bg-teal-800 hover:bg-teal-800 rounded-xl transition-all group border border-teal-900/20"
+                    >
+                      <div className="flex items-center gap-4">
+                        <FileText className="w-5 h-5 opacity-70" />
+                        <span className="font-display font-bold uppercase tracking-widest text-sm">Text File (.txt)</span>
+                      </div>
+                      <Download className="w-4 h-4 opacity-20" />
+                    </button>
+
+                    <button
+                      onClick={handleExportDocx}
+                      className="w-full flex items-center justify-between px-6 py-4 bg-teal-800 hover:bg-teal-800 rounded-xl transition-all group border border-teal-900/20"
+                    >
+                      <div className="flex items-center gap-4">
+                        <FileCode className="w-5 h-5 opacity-70" />
+                        <span className="font-display font-bold uppercase tracking-widest text-sm">Word Doc (.docx)</span>
+                      </div>
+                      <Download className="w-4 h-4 opacity-20" />
+                    </button>
+                  </div>
                 </div>
               </div>
 
@@ -1802,12 +2210,12 @@ export default function App() {
                   <CheckCircle2 className="w-6 h-6" />
                   <span className="font-display font-bold uppercase tracking-widest text-sm">Zen Optimization</span>
                 </div>
-                <p className="text-sm font-sans text-amber-600/60 leading-relaxed">
+                <p className="text-sm font-sans text-current opacity-80 leading-relaxed">
                   The neural engine is currently harmonized for high-fidelity Dharma signal processing. Ensure source audio is clear for maximum synchronization.
                 </p>
                 <div className="mt-6 pt-6 border-t border-spiritual-accent/10 flex justify-between items-center">
-                  <span className="text-[10px] font-mono uppercase tracking-widest opacity-40">Engine Harmony</span>
-                  <span className="px-2 py-0.5 bg-spiritual-accent/20 text-spiritual-accent rounded text-[10px] font-mono font-bold">BALANCED</span>
+                  <span className="text-[12px] font-mono uppercase tracking-widest opacity-70">Engine Harmony</span>
+                  <span className="px-2 py-0.5 bg-spiritual-accent/20 text-spiritual-accent rounded text-[12px] font-mono font-bold">BALANCED</span>
                 </div>
               </div>
             </aside>
@@ -1819,9 +2227,12 @@ export default function App() {
       <footer className="max-w-7xl mx-auto px-6 py-12 border-t border-spiritual-border text-center">
         <div className="flex flex-col items-center gap-4 opacity-30">
           <Leaf className="w-6 h-6" />
-          <p className="text-[10px] font-mono uppercase tracking-[0.4em]">© 2026 MAHAGURU CENTER // DHARMA SCRIBE // MAY ALL BEINGS BE HAPPY</p>
+          <p className="text-[12px] font-mono uppercase tracking-[0.4em]">© 2026 MAHAGURU CENTER // DHARMA SCRIBE // MAY ALL BEINGS BE HAPPY</p>
         </div>
       </footer>
     </div>
   );
 }
+
+
+
